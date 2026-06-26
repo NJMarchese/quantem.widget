@@ -11,6 +11,7 @@ const widgets = [
   { name: "show3d" },
   { name: "show3dslices" },
   { name: "show4dstem" },
+  { name: "show_polymer_4dstem" },
 ];
 
 rmSync("src/quantem/widget/static", { recursive: true, force: true });

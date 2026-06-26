@@ -19,6 +19,7 @@ from quantem.widget.show2d import Show2D
 from quantem.widget.show3d import Show3D
 from quantem.widget.show3dslices import Show3DSlices
 from quantem.widget.show4dstem import Show4DSTEM as _Show4DSTEMBase
+from quantem.widget.show_polymer_4dstem import show_polymer_4DSTEM, ShowPolymer4DSTEM
 from quantem.widget.io import load
 from quantem.widget.dpc import idpc, com
 from quantem.widget.info import device_info
@@ -184,4 +185,4 @@ def free_gpu(verbose: bool = True) -> float:
     return before - after
 
 
-__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "load", "idpc", "com", "device_info", "bf", "adf", "df", "profile", "free_gpu"]
+__all__ = ["Show2D", "Show3D", "Show3DSlices", "Show4DSTEM", "show_polymer_4DSTEM", "ShowPolymer4DSTEM", "load", "idpc", "com", "device_info", "bf", "adf", "df", "profile", "free_gpu"]
