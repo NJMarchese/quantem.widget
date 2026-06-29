@@ -1,15 +1,15 @@
 // show_polymer_4dstem: live-kernel Bragg-peak / polymer 4D-STEM viewer.
 //
 // Port of BraggPeaksPolymer.plot_interactive_peak_map / plot_interactive_image_map.
-// Left panel: clickable real-space intensity map (a click selects a scan
-// position). Middle panel: the diffraction pattern at that position, with the
+// Left panel: drag-selectable real-space intensity map (drag or click selects a
+// scan position). Middle panel: the diffraction pattern at that position, with the
 // detected Bragg peaks overlaid (hollow markers sized by intensity, the central
 // beam filled). Right panel (optional): the polar transform with its polar peaks.
 //
-// All heavy data is recomputed in the Python kernel on every click and shipped
-// over the comm; this file only colormaps + draws.
+// All heavy data is recomputed in the Python kernel on every scan-position
+// update and shipped over the comm; this file only colormaps + draws.
 import * as React from "react";
-import { createRender, useModelState } from "@anywidget/react";
+import { createRender, useModel, useModelState } from "@anywidget/react";
 import { COLORMAPS, applyColormap } from "../colormaps";
 
 const { useRef, useEffect, useMemo, useCallback } = React;
@@ -66,12 +66,35 @@ interface ImagePanelProps {
   aspectAuto?: boolean;
 }
 
+interface DpView {
+  key: string;
+  title: string;
+  data: Float32Array;
+  width: number;
+  height: number;
+  cmap: string;
+  vmin: number | null;
+  vmax: number | null;
+  dataVmin: number;
+  dataVmax: number;
+  peaksX: number[];
+  peaksY: number[];
+  peaksIntensity: number[];
+  centralIdx: number;
+  centerY: number;
+  centerX: number;
+  peakColor: string;
+  centralColor: string;
+}
+
 function ImagePanel(props: ImagePanelProps) {
   const {
     data, width, height, cmap, vmin, vmax, displayWidth, title,
     overlay, onPick, cursor, cursorColor, aspectAuto,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isPickingRef = useRef(false);
+  const lastPickRef = useRef<{ col: number; row: number } | null>(null);
 
   const dispW = displayWidth;
   const dispH = aspectAuto
@@ -114,33 +137,130 @@ function ImagePanel(props: ImagePanelProps) {
     }
   }, [data, width, height, cmap, vmin, vmax, dispW, dispH, overlay, cursor, cursorColor]);
 
-  const handleClick = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const pickFromPointer = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (!onPick) return;
       const rect = e.currentTarget.getBoundingClientRect();
-      const col = Math.floor(((e.clientX - rect.left) / rect.width) * width);
-      const row = Math.floor(((e.clientY - rect.top) / rect.height) * height);
-      onPick(
-        Math.max(0, Math.min(width - 1, col)),
-        Math.max(0, Math.min(height - 1, row)),
+      const col = Math.max(
+        0,
+        Math.min(width - 1, Math.floor(((e.clientX - rect.left) / rect.width) * width)),
       );
+      const row = Math.max(
+        0,
+        Math.min(height - 1, Math.floor(((e.clientY - rect.top) / rect.height) * height)),
+      );
+      const last = lastPickRef.current;
+      if (last && last.col === col && last.row === row) return;
+      lastPickRef.current = { col, row };
+      onPick(col, row);
     },
     [onPick, width, height],
   );
+
+  const handlePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!onPick || e.button !== 0) return;
+      e.preventDefault();
+      isPickingRef.current = true;
+      lastPickRef.current = null;
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+      pickFromPointer(e);
+    },
+    [onPick, pickFromPointer],
+  );
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!isPickingRef.current) return;
+      e.preventDefault();
+      pickFromPointer(e);
+    },
+    [pickFromPointer],
+  );
+
+  const stopPicking = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!isPickingRef.current) return;
+      isPickingRef.current = false;
+      lastPickRef.current = null;
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
+    },
+    [],
+  );
+
+  const pickFromMouse = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!onPick) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const col = Math.max(
+        0,
+        Math.min(width - 1, Math.floor(((e.clientX - rect.left) / rect.width) * width)),
+      );
+      const row = Math.max(
+        0,
+        Math.min(height - 1, Math.floor(((e.clientY - rect.top) / rect.height) * height)),
+      );
+      const last = lastPickRef.current;
+      if (last && last.col === col && last.row === row) return;
+      lastPickRef.current = { col, row };
+      onPick(col, row);
+    },
+    [onPick, width, height],
+  );
+
+  const handleMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!onPick || e.button !== 0) return;
+      e.preventDefault();
+      isPickingRef.current = true;
+      lastPickRef.current = null;
+      pickFromMouse(e);
+    },
+    [onPick, pickFromMouse],
+  );
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!isPickingRef.current) return;
+      e.preventDefault();
+      pickFromMouse(e);
+    },
+    [pickFromMouse],
+  );
+
+  const stopMousePicking = useCallback(() => {
+    if (!isPickingRef.current) return;
+    isPickingRef.current = false;
+    lastPickRef.current = null;
+  }, []);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
       <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4, fontFamily: "sans-serif" }}>{title}</div>
       <canvas
         ref={canvasRef}
-        onClick={onPick ? handleClick : undefined}
-        style={{ cursor: onPick ? "crosshair" : "default", imageRendering: "pixelated", border: "1px solid #ccc" }}
+        onPointerDown={onPick ? handlePointerDown : undefined}
+        onPointerMove={onPick ? handlePointerMove : undefined}
+        onPointerUp={onPick ? stopPicking : undefined}
+        onPointerCancel={onPick ? stopPicking : undefined}
+        onMouseDown={onPick ? handleMouseDown : undefined}
+        onMouseMove={onPick ? handleMouseMove : undefined}
+        onMouseUp={onPick ? stopMousePicking : undefined}
+        onMouseLeave={onPick ? stopMousePicking : undefined}
+        style={{
+          cursor: onPick ? "crosshair" : "default",
+          imageRendering: "pixelated",
+          border: "1px solid #ccc",
+          touchAction: "none",
+          userSelect: "none",
+        }}
       />
     </div>
   );
 }
 
 function ShowPolymer4DSTEM() {
+  const model = useModel();
   const [scanHeight] = useModelState<number>("scan_height");
   const [scanWidth] = useModelState<number>("scan_width");
   const [upsample] = useModelState<number>("upsample_factor");
@@ -168,8 +288,8 @@ function ShowPolymer4DSTEM() {
   const [peakSizeMin] = useModelState<number>("peak_size_min");
   const [peakSizeMax] = useModelState<number>("peak_size_max");
 
-  const [posRy, setPosRy] = useModelState<number>("pos_ry");
-  const [posRx, setPosRx] = useModelState<number>("pos_rx");
+  const [posRy] = useModelState<number>("pos_ry");
+  const [posRx] = useModelState<number>("pos_rx");
 
   const [dpBytes] = useModelState<unknown>("dp_bytes");
   const [dpHeight] = useModelState<number>("dp_height");
@@ -193,9 +313,68 @@ function ShowPolymer4DSTEM() {
   const [polarPeaksR] = useModelState<number[]>("polar_peaks_r_bin");
   const [polarPeaksTheta] = useModelState<number[]>("polar_peaks_theta_bin");
 
+  const [dpViewTitles] = useModelState<string[]>("dp_view_titles");
+  const [dpViewCmaps] = useModelState<string[]>("dp_view_cmaps");
+  const [dpViewColors] = useModelState<string[]>("dp_view_colors");
+  const [dpViewCentralColors] = useModelState<string[]>("dp_view_central_colors");
+  const [dpViewVmins] = useModelState<Array<number | null>>("dp_view_vmins");
+  const [dpViewVmaxs] = useModelState<Array<number | null>>("dp_view_vmaxs");
+
+  const [dpCurrentBytes] = useModelState<unknown>("dp_current_bytes");
+  const [dpCurrentHeight] = useModelState<number>("dp_current_height");
+  const [dpCurrentWidth] = useModelState<number>("dp_current_width");
+  const [dpCurrentDataVmin] = useModelState<number>("dp_current_data_vmin");
+  const [dpCurrentDataVmax] = useModelState<number>("dp_current_data_vmax");
+  const [dpCurrentPeaksX] = useModelState<number[]>("dp_current_peaks_x");
+  const [dpCurrentPeaksY] = useModelState<number[]>("dp_current_peaks_y");
+  const [dpCurrentPeaksIntensity] = useModelState<number[]>("dp_current_peaks_intensity");
+  const [dpCurrentCentralIdx] = useModelState<number>("dp_current_central_idx");
+  const [dpCurrentCenterY] = useModelState<number>("dp_current_center_y");
+  const [dpCurrentCenterX] = useModelState<number>("dp_current_center_x");
+
+  const [dpLamellarBytes] = useModelState<unknown>("dp_lamellar_bytes");
+  const [dpLamellarHeight] = useModelState<number>("dp_lamellar_height");
+  const [dpLamellarWidth] = useModelState<number>("dp_lamellar_width");
+  const [dpLamellarDataVmin] = useModelState<number>("dp_lamellar_data_vmin");
+  const [dpLamellarDataVmax] = useModelState<number>("dp_lamellar_data_vmax");
+  const [dpLamellarPeaksX] = useModelState<number[]>("dp_lamellar_peaks_x");
+  const [dpLamellarPeaksY] = useModelState<number[]>("dp_lamellar_peaks_y");
+  const [dpLamellarPeaksIntensity] = useModelState<number[]>("dp_lamellar_peaks_intensity");
+  const [dpLamellarCentralIdx] = useModelState<number>("dp_lamellar_central_idx");
+  const [dpLamellarCenterY] = useModelState<number>("dp_lamellar_center_y");
+  const [dpLamellarCenterX] = useModelState<number>("dp_lamellar_center_x");
+
+  const [dpBackboneBytes] = useModelState<unknown>("dp_backbone_bytes");
+  const [dpBackboneHeight] = useModelState<number>("dp_backbone_height");
+  const [dpBackboneWidth] = useModelState<number>("dp_backbone_width");
+  const [dpBackboneDataVmin] = useModelState<number>("dp_backbone_data_vmin");
+  const [dpBackboneDataVmax] = useModelState<number>("dp_backbone_data_vmax");
+  const [dpBackbonePeaksX] = useModelState<number[]>("dp_backbone_peaks_x");
+  const [dpBackbonePeaksY] = useModelState<number[]>("dp_backbone_peaks_y");
+  const [dpBackbonePeaksIntensity] = useModelState<number[]>("dp_backbone_peaks_intensity");
+  const [dpBackboneCentralIdx] = useModelState<number>("dp_backbone_central_idx");
+  const [dpBackboneCenterY] = useModelState<number>("dp_backbone_center_y");
+  const [dpBackboneCenterX] = useModelState<number>("dp_backbone_center_x");
+
+  const [dpPipiBytes] = useModelState<unknown>("dp_pipi_bytes");
+  const [dpPipiHeight] = useModelState<number>("dp_pipi_height");
+  const [dpPipiWidth] = useModelState<number>("dp_pipi_width");
+  const [dpPipiDataVmin] = useModelState<number>("dp_pipi_data_vmin");
+  const [dpPipiDataVmax] = useModelState<number>("dp_pipi_data_vmax");
+  const [dpPipiPeaksX] = useModelState<number[]>("dp_pipi_peaks_x");
+  const [dpPipiPeaksY] = useModelState<number[]>("dp_pipi_peaks_y");
+  const [dpPipiPeaksIntensity] = useModelState<number[]>("dp_pipi_peaks_intensity");
+  const [dpPipiCentralIdx] = useModelState<number>("dp_pipi_central_idx");
+  const [dpPipiCenterY] = useModelState<number>("dp_pipi_center_y");
+  const [dpPipiCenterX] = useModelState<number>("dp_pipi_center_x");
+
   const mapData = useMemo(() => asFloat32(mapBytes), [mapBytes]);
   const dpData = useMemo(() => asFloat32(dpBytes), [dpBytes, payloadSeq]);
   const polarData = useMemo(() => asFloat32(polarBytes), [polarBytes, payloadSeq]);
+  const dpCurrentData = useMemo(() => asFloat32(dpCurrentBytes), [dpCurrentBytes, payloadSeq]);
+  const dpLamellarData = useMemo(() => asFloat32(dpLamellarBytes), [dpLamellarBytes, payloadSeq]);
+  const dpBackboneData = useMemo(() => asFloat32(dpBackboneBytes), [dpBackboneBytes, payloadSeq]);
+  const dpPipiData = useMemo(() => asFloat32(dpPipiBytes), [dpPipiBytes, payloadSeq]);
 
   // Cursor on the (possibly upsampled) map, in map pixel coords.
   const mapCursor = useMemo(
@@ -207,10 +386,14 @@ function ShowPolymer4DSTEM() {
     (col: number, row: number) => {
       const ry = Math.floor(row / Math.max(1, upsample));
       const rx = Math.floor(col / Math.max(1, upsample));
-      setPosRy(Math.max(0, Math.min(scanHeight - 1, ry)));
-      setPosRx(Math.max(0, Math.min(scanWidth - 1, rx)));
+      const nextRy = Math.max(0, Math.min(scanHeight - 1, ry));
+      const nextRx = Math.max(0, Math.min(scanWidth - 1, rx));
+      if (nextRy === posRy && nextRx === posRx) return;
+      model.set("pos_ry", nextRy);
+      model.set("pos_rx", nextRx);
+      model.save_changes();
     },
-    [upsample, scanHeight, scanWidth, setPosRy, setPosRx],
+    [upsample, scanHeight, scanWidth, posRy, posRx, model],
   );
 
   // Peak overlay on the diffraction pattern (native DP coords -> display).
@@ -278,6 +461,150 @@ function ShowPolymer4DSTEM() {
   const dpUseVmin = dpVmin == null ? dpDataVmin : dpVmin;
   const dpUseVmax = dpVmax == null ? dpDataVmax : dpVmax;
 
+  const dpViews: DpView[] = useMemo(
+    () => [
+      {
+        key: "current",
+        title: dpViewTitles?.[0] ?? "Current",
+        data: dpCurrentData.length ? dpCurrentData : dpData,
+        width: dpCurrentWidth || dpWidth,
+        height: dpCurrentHeight || dpHeight,
+        cmap: dpViewCmaps?.[0] ?? dpCmap,
+        vmin: dpViewVmins?.[0] ?? dpUseVmin,
+        vmax: dpViewVmaxs?.[0] ?? dpUseVmax,
+        dataVmin: dpCurrentDataVmin || dpDataVmin,
+        dataVmax: dpCurrentDataVmax || dpDataVmax,
+        peaksX: dpCurrentPeaksX?.length ? dpCurrentPeaksX : peaksX,
+        peaksY: dpCurrentPeaksY?.length ? dpCurrentPeaksY : peaksY,
+        peaksIntensity: dpCurrentPeaksIntensity?.length ? dpCurrentPeaksIntensity : peaksIntensity,
+        centralIdx: dpCurrentCentralIdx ?? centralIdx,
+        centerY: dpCurrentCenterY || centerY,
+        centerX: dpCurrentCenterX || centerX,
+        peakColor: dpViewColors?.[0] ?? peakColor,
+        centralColor: dpViewCentralColors?.[0] ?? centralColor,
+      },
+      {
+        key: "lamellar",
+        title: dpViewTitles?.[1] ?? "Lamellar",
+        data: dpLamellarData,
+        width: dpLamellarWidth,
+        height: dpLamellarHeight,
+        cmap: dpViewCmaps?.[1] ?? "inferno",
+        vmin: dpViewVmins?.[1] ?? null,
+        vmax: dpViewVmaxs?.[1] ?? null,
+        dataVmin: dpLamellarDataVmin,
+        dataVmax: dpLamellarDataVmax,
+        peaksX: dpLamellarPeaksX ?? [],
+        peaksY: dpLamellarPeaksY ?? [],
+        peaksIntensity: dpLamellarPeaksIntensity ?? [],
+        centralIdx: dpLamellarCentralIdx,
+        centerY: dpLamellarCenterY,
+        centerX: dpLamellarCenterX,
+        peakColor: dpViewColors?.[1] ?? "#ff1f1f",
+        centralColor: dpViewCentralColors?.[1] ?? "#00d5e8",
+      },
+      {
+        key: "backbone",
+        title: dpViewTitles?.[2] ?? "Backbone",
+        data: dpBackboneData,
+        width: dpBackboneWidth,
+        height: dpBackboneHeight,
+        cmap: dpViewCmaps?.[2] ?? "gray",
+        vmin: dpViewVmins?.[2] ?? null,
+        vmax: dpViewVmaxs?.[2] ?? null,
+        dataVmin: dpBackboneDataVmin,
+        dataVmax: dpBackboneDataVmax,
+        peaksX: dpBackbonePeaksX ?? [],
+        peaksY: dpBackbonePeaksY ?? [],
+        peaksIntensity: dpBackbonePeaksIntensity ?? [],
+        centralIdx: dpBackboneCentralIdx,
+        centerY: dpBackboneCenterY,
+        centerX: dpBackboneCenterX,
+        peakColor: dpViewColors?.[2] ?? "#7bdc3c",
+        centralColor: dpViewCentralColors?.[2] ?? "#00d5e8",
+      },
+      {
+        key: "pipi",
+        title: dpViewTitles?.[3] ?? "pi-pi",
+        data: dpPipiData,
+        width: dpPipiWidth,
+        height: dpPipiHeight,
+        cmap: dpViewCmaps?.[3] ?? "gray",
+        vmin: dpViewVmins?.[3] ?? null,
+        vmax: dpViewVmaxs?.[3] ?? null,
+        dataVmin: dpPipiDataVmin,
+        dataVmax: dpPipiDataVmax,
+        peaksX: dpPipiPeaksX ?? [],
+        peaksY: dpPipiPeaksY ?? [],
+        peaksIntensity: dpPipiPeaksIntensity ?? [],
+        centralIdx: dpPipiCentralIdx,
+        centerY: dpPipiCenterY,
+        centerX: dpPipiCenterX,
+        peakColor: dpViewColors?.[3] ?? "#ffee00",
+        centralColor: dpViewCentralColors?.[3] ?? "#00d5e8",
+      },
+    ],
+    [
+      dpViewTitles, dpViewCmaps, dpViewVmins, dpViewVmaxs, dpViewColors, dpViewCentralColors,
+      dpCurrentData, dpCurrentWidth, dpCurrentHeight, dpCurrentDataVmin, dpCurrentDataVmax,
+      dpCurrentPeaksX, dpCurrentPeaksY, dpCurrentPeaksIntensity, dpCurrentCentralIdx,
+      dpCurrentCenterY, dpCurrentCenterX, dpData, dpWidth, dpHeight, dpCmap, dpUseVmin,
+      dpUseVmax, dpDataVmin, dpDataVmax, peaksX, peaksY, peaksIntensity, centralIdx,
+      centerY, centerX, peakColor, centralColor, dpLamellarData, dpLamellarWidth,
+      dpLamellarHeight, dpLamellarDataVmin, dpLamellarDataVmax, dpLamellarPeaksX,
+      dpLamellarPeaksY, dpLamellarPeaksIntensity, dpLamellarCentralIdx, dpLamellarCenterY,
+      dpLamellarCenterX, dpBackboneData, dpBackboneWidth, dpBackboneHeight,
+      dpBackboneDataVmin, dpBackboneDataVmax, dpBackbonePeaksX, dpBackbonePeaksY,
+      dpBackbonePeaksIntensity, dpBackboneCentralIdx, dpBackboneCenterY, dpBackboneCenterX,
+      dpPipiData, dpPipiWidth, dpPipiHeight, dpPipiDataVmin, dpPipiDataVmax, dpPipiPeaksX,
+      dpPipiPeaksY, dpPipiPeaksIntensity, dpPipiCentralIdx, dpPipiCenterY, dpPipiCenterX,
+    ],
+  );
+
+  const makeDpOverlay = useCallback(
+    (view: DpView) => (ctx: CanvasRenderingContext2D, scaleX: number, scaleY: number) => {
+      const drawDot = (x: number, y: number, r: number, fill: string) => {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        ctx.beginPath();
+        ctx.arc((x + 0.5) * scaleX, (y + 0.5) * scaleY, r, 0, 2 * Math.PI);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "#000";
+        ctx.stroke();
+      };
+      if (!showPeaks || !view.peaksX || view.peaksX.length === 0) {
+        drawDot(view.centerX, view.centerY, 5, view.centralColor);
+        return;
+      }
+      let imin = Infinity;
+      let imax = -Infinity;
+      for (let i = 0; i < view.peaksIntensity.length; i++) {
+        if (i === view.centralIdx) continue;
+        imin = Math.min(imin, view.peaksIntensity[i]);
+        imax = Math.max(imax, view.peaksIntensity[i]);
+      }
+      const range = imax > imin ? imax - imin : 1;
+      for (let i = 0; i < view.peaksX.length; i++) {
+        const x = view.peaksX[i];
+        const y = view.peaksY[i];
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        if (i === view.centralIdx) {
+          drawDot(x, y, 5, view.centralColor);
+          continue;
+        }
+        const norm = view.peaksIntensity.length ? (view.peaksIntensity[i] - imin) / range : 0.5;
+        const r = peakSizeMin + (Number.isFinite(norm) ? norm : 0.5) * (peakSizeMax - peakSizeMin);
+        ctx.beginPath();
+        ctx.arc((x + 0.5) * scaleX, (y + 0.5) * scaleY, r, 0, 2 * Math.PI);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = view.peakColor;
+        ctx.stroke();
+      }
+    },
+    [showPeaks, peakSizeMin, peakSizeMax],
+  );
+
   const checkbox = (label: string, checked: boolean, onChange: (v: boolean) => void) => (
     <label style={{ fontSize: 12, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 4 }}>
       <input type="checkbox" checked={!!checked} onChange={(e) => onChange(e.target.checked)} />
@@ -309,17 +636,20 @@ function ShowPolymer4DSTEM() {
           cursor={mapCursor}
           cursorColor="#ff3b30"
         />
-        <ImagePanel
-          data={dpData}
-          width={dpWidth}
-          height={dpHeight}
-          cmap={dpCmap}
-          vmin={dpUseVmin}
-          vmax={dpUseVmax}
-          displayWidth={320}
-          title={`Diffraction Pattern (Ry=${posRy}, Rx=${posRx})`}
-          overlay={dpOverlay}
-        />
+        {dpViews.map((view) => (
+          <ImagePanel
+            key={view.key}
+            data={view.data}
+            width={view.width}
+            height={view.height}
+            cmap={view.cmap}
+            vmin={view.vmin == null ? view.dataVmin : view.vmin}
+            vmax={view.vmax == null ? view.dataVmax : view.vmax}
+            displayWidth={view.key === "current" ? 300 : 220}
+            title={`${view.title} DP (Ry=${posRy}, Rx=${posRx})`}
+            overlay={makeDpOverlay(view)}
+          />
+        ))}
         {hasPolar && showPolar ? (
           <ImagePanel
             data={polarData}

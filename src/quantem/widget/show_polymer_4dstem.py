@@ -26,6 +26,11 @@ import traitlets
 
 from quantem.widget.utils.array import to_numpy
 
+try:
+    from scipy.ndimage import gaussian_filter
+except Exception:  # pragma: no cover - scipy is optional for downstream users.
+    gaussian_filter = None
+
 # Intensity field used by BraggPeaksPolymer.peak_intensities (matches the
 # `intensity_field='intensities'` default in plot_interactive_peak_map).
 _DEFAULT_INTENSITY_FIELD = "intensities"
@@ -90,6 +95,29 @@ def _normalized_dp(dataset_cartesian, ry, rx, *, norm_upper_quantile, norm_power
     return dp
 
 
+def _dp_view(dataset_cartesian, ry, rx, *, norm_upper_quantile, norm_power, gaussian_filter_sigma, zoom):
+    """Tutorial-style display transform for one DP panel."""
+    dp = _normalized_dp(
+        dataset_cartesian,
+        ry,
+        rx,
+        norm_upper_quantile=norm_upper_quantile,
+        norm_power=norm_power,
+    )
+    if gaussian_filter_sigma and gaussian_filter_sigma > 0 and gaussian_filter is not None:
+        dp = gaussian_filter(dp, sigma=float(gaussian_filter_sigma)).astype(np.float32, copy=False)
+
+    x0 = y0 = 0
+    if zoom and zoom > 1:
+        h, w = dp.shape
+        crop_h = max(1, int(round(h / float(zoom))))
+        crop_w = max(1, int(round(w / float(zoom))))
+        y0 = max(0, (h - crop_h) // 2)
+        x0 = max(0, (w - crop_w) // 2)
+        dp = dp[y0 : y0 + crop_h, x0 : x0 + crop_w]
+    return np.ascontiguousarray(dp, dtype=np.float32), int(x0), int(y0)
+
+
 def _display_center(image_centers, ry, rx, dp_shape):
     """Center (y, x): stored beam center if valid, else geometric center."""
     cy, cx = dp_shape[0] / 2.0, dp_shape[1] / 2.0
@@ -118,6 +146,77 @@ def _as_float_list(arr):
     if arr is None:
         return []
     return [float(v) for v in np.asarray(arr).ravel()]
+
+
+def _shifted_float_list(arr, offset, limit):
+    if arr is None:
+        return []
+    values = []
+    for v in np.asarray(arr).ravel():
+        shifted = float(v) - float(offset)
+        if 0 <= shifted < limit:
+            values.append(shifted)
+        else:
+            values.append(float("nan"))
+    return values
+
+
+_DP_VIEW_PRESETS = (
+    # First panel: current widget behavior.
+    {
+        "key": "current",
+        "title": "Current",
+        "cmap": None,
+        "color": "#ff3b30",
+        "central_color": "#00d5e8",
+        "norm_upper_quantile": None,
+        "norm_power": None,
+        "gaussian_filter_sigma": None,
+        "zoom": 1.0,
+        "vmin": None,
+        "vmax": None,
+    },
+    # These three mirror the tutorial_minimal plot_interactive_peak_map calls.
+    {
+        "key": "lamellar",
+        "title": "Lamellar",
+        "cmap": "inferno",
+        "color": "#ff1f1f",
+        "central_color": "#00d5e8",
+        "norm_upper_quantile": 0.9999,
+        "norm_power": 1.5,
+        "gaussian_filter_sigma": 0.75,
+        "zoom": 4.0,
+        "vmin": 0.2,
+        "vmax": 5.0,
+    },
+    {
+        "key": "backbone",
+        "title": "Backbone",
+        "cmap": "gray",
+        "color": "#7bdc3c",
+        "central_color": "#00d5e8",
+        "norm_upper_quantile": 0.9999,
+        "norm_power": 1.5,
+        "gaussian_filter_sigma": 1.5,
+        "zoom": 2.0,
+        "vmin": 0.035,
+        "vmax": 0.11,
+    },
+    {
+        "key": "pipi",
+        "title": "pi-pi",
+        "cmap": "gray",
+        "color": "#ffee00",
+        "central_color": "#00d5e8",
+        "norm_upper_quantile": 0.9999,
+        "norm_power": 1.0,
+        "gaussian_filter_sigma": 4.0,
+        "zoom": 1.0,
+        "vmin": 0.1,
+        "vmax": 1.0,
+    },
+)
 
 
 class ShowPolymer4DSTEM(anywidget.AnyWidget):
@@ -199,6 +298,61 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     polar_peaks_r_bin = traitlets.List(traitlets.Float()).tag(sync=True)
     polar_peaks_theta_bin = traitlets.List(traitlets.Float()).tag(sync=True)
 
+    dp_view_titles = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    dp_view_cmaps = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    dp_view_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    dp_view_central_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    dp_view_vmins = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+    dp_view_vmaxs = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+
+    dp_current_bytes = traitlets.Bytes(b"").tag(sync=True)
+    dp_current_height = traitlets.Int(1).tag(sync=True)
+    dp_current_width = traitlets.Int(1).tag(sync=True)
+    dp_current_data_vmin = traitlets.Float(0.0).tag(sync=True)
+    dp_current_data_vmax = traitlets.Float(1.0).tag(sync=True)
+    dp_current_peaks_x = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_current_peaks_y = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_current_peaks_intensity = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_current_central_idx = traitlets.Int(-1).tag(sync=True)
+    dp_current_center_y = traitlets.Float(0.0).tag(sync=True)
+    dp_current_center_x = traitlets.Float(0.0).tag(sync=True)
+
+    dp_lamellar_bytes = traitlets.Bytes(b"").tag(sync=True)
+    dp_lamellar_height = traitlets.Int(1).tag(sync=True)
+    dp_lamellar_width = traitlets.Int(1).tag(sync=True)
+    dp_lamellar_data_vmin = traitlets.Float(0.0).tag(sync=True)
+    dp_lamellar_data_vmax = traitlets.Float(1.0).tag(sync=True)
+    dp_lamellar_peaks_x = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_lamellar_peaks_y = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_lamellar_peaks_intensity = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_lamellar_central_idx = traitlets.Int(-1).tag(sync=True)
+    dp_lamellar_center_y = traitlets.Float(0.0).tag(sync=True)
+    dp_lamellar_center_x = traitlets.Float(0.0).tag(sync=True)
+
+    dp_backbone_bytes = traitlets.Bytes(b"").tag(sync=True)
+    dp_backbone_height = traitlets.Int(1).tag(sync=True)
+    dp_backbone_width = traitlets.Int(1).tag(sync=True)
+    dp_backbone_data_vmin = traitlets.Float(0.0).tag(sync=True)
+    dp_backbone_data_vmax = traitlets.Float(1.0).tag(sync=True)
+    dp_backbone_peaks_x = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_backbone_peaks_y = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_backbone_peaks_intensity = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_backbone_central_idx = traitlets.Int(-1).tag(sync=True)
+    dp_backbone_center_y = traitlets.Float(0.0).tag(sync=True)
+    dp_backbone_center_x = traitlets.Float(0.0).tag(sync=True)
+
+    dp_pipi_bytes = traitlets.Bytes(b"").tag(sync=True)
+    dp_pipi_height = traitlets.Int(1).tag(sync=True)
+    dp_pipi_width = traitlets.Int(1).tag(sync=True)
+    dp_pipi_data_vmin = traitlets.Float(0.0).tag(sync=True)
+    dp_pipi_data_vmax = traitlets.Float(1.0).tag(sync=True)
+    dp_pipi_peaks_x = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_pipi_peaks_y = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_pipi_peaks_intensity = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_pipi_central_idx = traitlets.Int(-1).tag(sync=True)
+    dp_pipi_center_y = traitlets.Float(0.0).tag(sync=True)
+    dp_pipi_center_x = traitlets.Float(0.0).tag(sync=True)
+
     def __init__(
         self,
         bragg_peaks,
@@ -261,6 +415,18 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.dp_cmap = dp_cmap
             self.dp_vmin = None if vmin_cartesian is None else float(vmin_cartesian)
             self.dp_vmax = None if vmax_cartesian is None else float(vmax_cartesian)
+            self.dp_view_titles = [p["title"] for p in _DP_VIEW_PRESETS]
+            self.dp_view_cmaps = [p["cmap"] or dp_cmap for p in _DP_VIEW_PRESETS]
+            self.dp_view_colors = [p["color"] for p in _DP_VIEW_PRESETS]
+            self.dp_view_central_colors = [p["central_color"] for p in _DP_VIEW_PRESETS]
+            self.dp_view_vmins = [
+                self.dp_vmin if p["vmin"] is None else float(p["vmin"])
+                for p in _DP_VIEW_PRESETS
+            ]
+            self.dp_view_vmaxs = [
+                self.dp_vmax if p["vmax"] is None else float(p["vmax"])
+                for p in _DP_VIEW_PRESETS
+            ]
             self.has_peaks = has_peaks
             self.has_polar = has_polar
             self.show_peaks = has_peaks
@@ -289,30 +455,34 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         ry = max(0, min(int(self.pos_ry), self.scan_height - 1))
         rx = max(0, min(int(self.pos_rx), self.scan_width - 1))
 
-        dp = _normalized_dp(
-            dataset, ry, rx,
+        base_dp = _normalized_dp(
+            dataset,
+            ry,
+            rx,
             norm_upper_quantile=self._norm_upper_quantile,
             norm_power=self._norm_power,
         )
-        dvmin, dvmax = _display_limits(dp)
-        self.dp_bytes = np.ascontiguousarray(dp, dtype=np.float32).tobytes()
-        self.dp_height = int(dp.shape[0])
-        self.dp_width = int(dp.shape[1])
-        self.dp_data_vmin = dvmin
-        self.dp_data_vmax = dvmax
+        base_vmin, base_vmax = _display_limits(base_dp)
+        self.dp_bytes = np.ascontiguousarray(base_dp, dtype=np.float32).tobytes()
+        self.dp_height = int(base_dp.shape[0])
+        self.dp_width = int(base_dp.shape[1])
+        self.dp_data_vmin = base_vmin
+        self.dp_data_vmax = base_vmax
 
+        source_center = _display_center(
+            getattr(bp, "image_centers", None), ry, rx, base_dp.shape
+        )
         center = _display_center(
-            getattr(bp, "image_centers", None), ry, rx, dp.shape
+            getattr(bp, "image_centers", None), ry, rx, base_dp.shape
         )
         self.center_y, self.center_x = float(center[0]), float(center[1])
 
+        px = py = ints = r_invA = None
         if self.has_peaks:
             px = bp.peak_coordinates_cartesian["x_pixels"][ry, rx]
             py = bp.peak_coordinates_cartesian["y_pixels"][ry, rx]
-            ints = None
             if getattr(bp, "peak_intensities", None) is not None:
                 ints = bp.peak_intensities[self._intensity_field][ry, rx]
-            r_invA = None
             if getattr(bp, "polar_peaks", None) is not None:
                 r_invA = bp.polar_peaks["r_invA"][ry, rx]
             self.peaks_x = _as_float_list(px)
@@ -322,6 +492,8 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         else:
             self.peaks_x, self.peaks_y, self.peaks_intensity = [], [], []
             self.central_idx = -1
+
+        self._update_dp_views(dataset, ry, rx, px, py, ints, r_invA, source_center)
 
         if self.has_polar:
             polar = np.asarray(
@@ -336,6 +508,65 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self._update_polar_peaks(ry, rx)
 
         self.payload_seq += 1
+
+    def _update_dp_views(self, dataset, ry, rx, px, py, ints, r_invA, source_center):
+        for preset in _DP_VIEW_PRESETS:
+            key = preset["key"]
+            if key == "current":
+                dp = _normalized_dp(
+                    dataset,
+                    ry,
+                    rx,
+                    norm_upper_quantile=self._norm_upper_quantile,
+                    norm_power=self._norm_power,
+                )
+                x0 = y0 = 0
+            else:
+                dp, x0, y0 = _dp_view(
+                    dataset,
+                    ry,
+                    rx,
+                    norm_upper_quantile=preset["norm_upper_quantile"],
+                    norm_power=preset["norm_power"],
+                    gaussian_filter_sigma=preset["gaussian_filter_sigma"],
+                    zoom=preset["zoom"],
+                )
+
+            dvmin, dvmax = _display_limits(dp)
+            setattr(self, f"dp_{key}_bytes", np.ascontiguousarray(dp, dtype=np.float32).tobytes())
+            setattr(self, f"dp_{key}_height", int(dp.shape[0]))
+            setattr(self, f"dp_{key}_width", int(dp.shape[1]))
+            setattr(self, f"dp_{key}_data_vmin", dvmin)
+            setattr(self, f"dp_{key}_data_vmax", dvmax)
+            setattr(self, f"dp_{key}_center_y", float(source_center[0]) - float(y0))
+            setattr(self, f"dp_{key}_center_x", float(source_center[1]) - float(x0))
+
+            if self.has_peaks:
+                shifted_x = _shifted_float_list(px, x0, dp.shape[1])
+                shifted_y = _shifted_float_list(py, y0, dp.shape[0])
+                keep = [
+                    i
+                    for i, (x, y) in enumerate(zip(shifted_x, shifted_y))
+                    if np.isfinite(x) and np.isfinite(y)
+                ]
+                peak_x = [shifted_x[i] for i in keep]
+                peak_y = [shifted_y[i] for i in keep]
+                peak_i_source = _as_float_list(ints)
+                peak_i = [peak_i_source[i] if i < len(peak_i_source) else 1.0 for i in keep]
+                central_source = _central_peak_index(px, py, r_invA, source_center)
+                try:
+                    central_idx = keep.index(central_source)
+                except ValueError:
+                    central_idx = -1
+                setattr(self, f"dp_{key}_peaks_x", peak_x)
+                setattr(self, f"dp_{key}_peaks_y", peak_y)
+                setattr(self, f"dp_{key}_peaks_intensity", peak_i)
+                setattr(self, f"dp_{key}_central_idx", central_idx)
+            else:
+                setattr(self, f"dp_{key}_peaks_x", [])
+                setattr(self, f"dp_{key}_peaks_y", [])
+                setattr(self, f"dp_{key}_peaks_intensity", [])
+                setattr(self, f"dp_{key}_central_idx", -1)
 
     def _update_polar_peaks(self, ry, rx):
         bp = self._bp
