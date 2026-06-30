@@ -12,7 +12,7 @@ import * as React from "react";
 import { createRender, useModel, useModelState } from "@anywidget/react";
 import { COLORMAPS, applyColormap } from "../colormaps";
 
-const { useRef, useEffect, useMemo, useCallback } = React;
+const { useRef, useEffect, useMemo, useCallback, useState } = React;
 
 // Bytes traits arrive as a DataView (anywidget). Reinterpret as Float32Array.
 function asFloat32(value: unknown): Float32Array {
@@ -509,18 +509,128 @@ function ShowPolymer4DSTEM() {
     [posRx, posRy, upsample],
   );
 
-  const handleMapPick = useCallback(
-    (col: number, row: number) => {
-      const ry = Math.floor(row / Math.max(1, upsample));
-      const rx = Math.floor(col / Math.max(1, upsample));
-      const nextRy = Math.max(0, Math.min(scanHeight - 1, ry));
-      const nextRx = Math.max(0, Math.min(scanWidth - 1, rx));
+  // Drag throttle: the crosshair + inset are driven by pos_ry/pos_rx local model
+  // state and update on every move (no kernel involvement), but each
+  // `save_changes()` triggers a full kernel recompute of every DP panel. Firing
+  // one per pixel during a drag floods the single-threaded kernel and builds a
+  // backlog (the ~0.5 s DP lag). Instead we keep at most one request in flight,
+  // coalescing intermediate positions and always sending the final one.
+  const pendingPosRef = useRef<{ ry: number; rx: number } | null>(null);
+  const lastSentRef = useRef<{ ry: number; rx: number } | null>(null);
+  const inFlightRef = useRef(false);
+  const watchdogRef = useRef<number | null>(null);
+  const firstSeqRef = useRef(true);
+
+  // Flush the latest pending position to the kernel, if newer than the last sent.
+  const flushPending = useCallback(() => {
+    const p = pendingPosRef.current;
+    if (!p) return;
+    const last = lastSentRef.current;
+    if (last && last.ry === p.ry && last.rx === p.rx) return;
+    inFlightRef.current = true;
+    lastSentRef.current = p;
+    if (watchdogRef.current != null) clearTimeout(watchdogRef.current);
+    // Safety net: if a recompute response is ever lost, don't stall forever.
+    watchdogRef.current = window.setTimeout(() => {
+      watchdogRef.current = null;
+      inFlightRef.current = false;
+      flushPending();
+    }, 3000);
+    model.save_changes(); // flushes the pos_ry/pos_rx already set on the model
+  }, [model]);
+
+  // Single entry point for every position change (map click/drag, arrow keys,
+  // typed X/Y): clamp to the scan grid, update the model locally so the crosshair
+  // + inset track immediately, then coalesce kernel recomputes via flushPending.
+  const commitPosition = useCallback(
+    (ry: number, rx: number) => {
+      const nextRy = Math.max(0, Math.min(scanHeight - 1, Math.round(ry)));
+      const nextRx = Math.max(0, Math.min(scanWidth - 1, Math.round(rx)));
       if (nextRy === posRy && nextRx === posRx) return;
       model.set("pos_ry", nextRy);
       model.set("pos_rx", nextRx);
-      model.save_changes();
+      pendingPosRef.current = { ry: nextRy, rx: nextRx };
+      // Only kick a kernel recompute if none is in flight; otherwise the trailing
+      // flush (on the next payload response) will pick up this latest position.
+      if (!inFlightRef.current) flushPending();
     },
-    [upsample, scanHeight, scanWidth, posRy, posRx, model],
+    [scanHeight, scanWidth, posRy, posRx, model, flushPending],
+  );
+
+  // Root container is focusable so it can receive arrow-key events; clicking the
+  // map focuses it so keyboard nav works without an extra tab/click.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const handleMapPick = useCallback(
+    (col: number, row: number) => {
+      containerRef.current?.focus();
+      commitPosition(
+        Math.floor(row / Math.max(1, upsample)),
+        Math.floor(col / Math.max(1, upsample)),
+      );
+    },
+    [upsample, commitPosition],
+  );
+
+  // Arrow keys nudge the selected position by one scan pixel (10 with Shift).
+  // Ignored while a text field is focused so typing in the X/Y boxes still works.
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      let dRy = 0;
+      let dRx = 0;
+      switch (e.key) {
+        case "ArrowUp": dRy = -1; break;
+        case "ArrowDown": dRy = 1; break;
+        case "ArrowLeft": dRx = -1; break;
+        case "ArrowRight": dRx = 1; break;
+        default: return;
+      }
+      e.preventDefault();
+      const step = e.shiftKey ? 10 : 1;
+      commitPosition(posRy + dRy * step, posRx + dRx * step);
+    },
+    [posRy, posRx, commitPosition],
+  );
+
+  // Editable X (Rx) / Y (Ry) text fields. Local string state lets the user type
+  // freely; we re-sync from the model whenever the committed position changes
+  // (e.g. after a click, drag, or arrow-key move).
+  const [ryInput, setRyInput] = useState<string>(String(posRy));
+  const [rxInput, setRxInput] = useState<string>(String(posRx));
+  useEffect(() => { setRyInput(String(posRy)); }, [posRy]);
+  useEffect(() => { setRxInput(String(posRx)); }, [posRx]);
+
+  const commitInputs = useCallback(() => {
+    const ry = parseInt(ryInput, 10);
+    const rx = parseInt(rxInput, 10);
+    commitPosition(
+      Number.isFinite(ry) ? ry : posRy,
+      Number.isFinite(rx) ? rx : posRx,
+    );
+  }, [ryInput, rxInput, posRy, posRx, commitPosition]);
+
+  // A new payload (payload_seq bump) means the in-flight recompute finished;
+  // clear the gate and send whatever position the drag has since landed on.
+  useEffect(() => {
+    if (firstSeqRef.current) {
+      firstSeqRef.current = false;
+      return;
+    }
+    inFlightRef.current = false;
+    if (watchdogRef.current != null) {
+      clearTimeout(watchdogRef.current);
+      watchdogRef.current = null;
+    }
+    flushPending();
+  }, [payloadSeq, flushPending]);
+
+  useEffect(
+    () => () => {
+      if (watchdogRef.current != null) clearTimeout(watchdogRef.current);
+    },
+    [],
   );
 
   // Polar peaks overlay (r_bin -> x, theta_bin -> y).
@@ -694,12 +804,46 @@ function ShowPolymer4DSTEM() {
     </label>
   );
 
+  const posField = (
+    label: string,
+    value: string,
+    setValue: (v: string) => void,
+    max: number,
+  ) => (
+    <label style={{ fontSize: 12, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 4 }}>
+      {label}
+      <input
+        type="number"
+        min={0}
+        max={Math.max(0, max)}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitInputs();
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        onBlur={commitInputs}
+        style={{ width: 56, fontSize: 12 }}
+      />
+    </label>
+  );
+
   return (
-    <div style={{ fontFamily: "sans-serif" }}>
+    <div
+      ref={containerRef}
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
+      style={{ fontFamily: "sans-serif", outline: "none" }}
+    >
       {title ? <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>{title}</div> : null}
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-        <span style={{ fontSize: 12, color: "#555" }}>
-          Scan position: Ry={posRy}, Rx={posRx}
+      <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+        {posField(`Rx (X, 0-${Math.max(0, scanWidth - 1)})`, rxInput, setRxInput, scanWidth - 1)}
+        {posField(`Ry (Y, 0-${Math.max(0, scanHeight - 1)})`, ryInput, setRyInput, scanHeight - 1)}
+        <span style={{ fontSize: 11, color: "#888" }}>
+          click map or use arrow keys (Shift = ×10)
         </span>
         {hasPeaks ? checkbox("Show peaks", showPeaks, setShowPeaks) : null}
         {hasPolar ? checkbox("Show polar", showPolar, setShowPolar) : null}
