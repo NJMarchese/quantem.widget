@@ -53,23 +53,34 @@ def _mean_intensity_map(dataset_cartesian, scan_shape):
 
 
 def _resolve_intensity_map(dataset_cartesian, intensity_map, scan_shape):
-    """Return (map_float32, upsample_factor). None -> mean map at upsample 1."""
+    """Return (map_float32, upsample_factor, is_rgb). None -> mean map at upsample 1.
+
+    A 2D array is sent as a scalar field (colormapped on the frontend via ``map_cmap``).
+    A 3D ``(H, W, 3|4)`` array is treated as a true RGB(A) image: the first three
+    channels are kept (clipped to ``[0, 1]``) and drawn directly, bypassing the colormap.
+    """
     Ry, Rx = scan_shape
     if intensity_map is None:
-        return _mean_intensity_map(dataset_cartesian, scan_shape), 1
+        return _mean_intensity_map(dataset_cartesian, scan_shape), 1, False
     arr = np.asarray(to_numpy(intensity_map))
-    if arr.ndim == 3:
-        # RGB(A) map: collapse to luminance for the grayscale colormap path.
-        arr = arr[..., :3].mean(axis=2)
-    if arr.ndim != 2:
-        raise ValueError(f"intensity_map must be 2D (or RGB), got shape {arr.shape}")
+    is_rgb = arr.ndim == 3
+    if is_rgb:
+        # RGB(A) map: keep the first three channels and render without a colormap.
+        arr = arr[..., :3]
+    elif arr.ndim != 2:
+        raise ValueError(
+            f"intensity_map must be 2D or RGB ((H, W, 3)), got shape {arr.shape}"
+        )
     up = arr.shape[0] // Ry
     if up < 1 or arr.shape[0] % Ry or arr.shape[1] % Rx or arr.shape[1] // Rx != up:
         raise ValueError(
             f"intensity_map shape {arr.shape} is not an integer multiple of "
             f"the scan grid ({Ry}, {Rx})"
         )
-    return arr.astype(np.float32, copy=False), int(up)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    if is_rgb:
+        arr = np.clip(arr, 0.0, 1.0)
+    return arr, int(up), is_rgb
 
 
 def _display_limits(arr):
@@ -95,7 +106,17 @@ def _normalized_dp(dataset_cartesian, ry, rx, *, norm_upper_quantile, norm_power
     return dp
 
 
-def _dp_view(dataset_cartesian, ry, rx, *, norm_upper_quantile, norm_power, gaussian_filter_sigma, zoom):
+def _dp_view(
+    dataset_cartesian,
+    ry,
+    rx,
+    *,
+    norm_upper_quantile,
+    norm_power,
+    gaussian_filter_sigma,
+    zoom,
+    center=None,
+):
     """Tutorial-style display transform for one DP panel."""
     dp = _normalized_dp(
         dataset_cartesian,
@@ -112,8 +133,14 @@ def _dp_view(dataset_cartesian, ry, rx, *, norm_upper_quantile, norm_power, gaus
         h, w = dp.shape
         crop_h = max(1, int(round(h / float(zoom))))
         crop_w = max(1, int(round(w / float(zoom))))
-        y0 = max(0, (h - crop_h) // 2)
-        x0 = max(0, (w - crop_w) // 2)
+        if center is None:
+            cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
+        else:
+            cy, cx = center
+        y0 = int(round(float(cy) - (crop_h - 1) / 2.0))
+        x0 = int(round(float(cx) - (crop_w - 1) / 2.0))
+        y0 = min(max(y0, 0), h - crop_h)
+        x0 = min(max(x0, 0), w - crop_w)
         dp = dp[y0 : y0 + crop_h, x0 : x0 + crop_w]
     return np.ascontiguousarray(dp, dtype=np.float32), int(x0), int(y0)
 
@@ -206,15 +233,15 @@ _DP_VIEW_PRESETS = (
     {
         "key": "pipi",
         "title": "pi-pi",
-        "cmap": "gray",
-        "color": "#ffee00",
+        "cmap": "turbo_black",
+        "color": "#ff1f1f",
         "central_color": "#00d5e8",
         "norm_upper_quantile": 0.9999,
-        "norm_power": 1.0,
+        "norm_power": 1.5,
         "gaussian_filter_sigma": 4.0,
         "zoom": 1.0,
-        "vmin": 0.1,
-        "vmax": 1.0,
+        "vmin": 0.055,
+        "vmax": 0.13,
     },
 )
 
@@ -241,12 +268,15 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     upsample_factor = traitlets.Int(1).tag(sync=True)
     title = traitlets.Unicode("").tag(sync=True)
 
-    map_bytes = traitlets.Bytes(b"").tag(sync=True)      # float32, map_height x map_width
+    map_bytes = traitlets.Bytes(b"").tag(sync=True)      # float32; (h, w) scalar or (h, w, 3) RGB
     map_height = traitlets.Int(1).tag(sync=True)
     map_width = traitlets.Int(1).tag(sync=True)
     map_vmin = traitlets.Float(0.0).tag(sync=True)
     map_vmax = traitlets.Float(1.0).tag(sync=True)
     map_cmap = traitlets.Unicode("viridis").tag(sync=True)
+    map_is_rgb = traitlets.Bool(False).tag(sync=True)    # True -> draw RGB directly, skip cmap
+    show_inset = traitlets.Bool(True).tag(sync=True)     # zoomed neighborhood of selected pixel
+    inset_size = traitlets.Int(7).tag(sync=True)         # NxN inset window (odd)
     map_title = traitlets.Unicode("Intensity Map").tag(sync=True)
 
     dp_cmap = traitlets.Unicode("gray").tag(sync=True)
@@ -367,6 +397,8 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         intensity_field=_DEFAULT_INTENSITY_FIELD,
         show_polar=True,
         two_fold_symmetry=True,
+        show_inset=True,
+        inset_size=7,
         title="",
         ry=None,
         rx=None,
@@ -398,8 +430,9 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         has_peaks = peak_coords is not None
         has_polar = bool(show_polar and polar_data is not None)
 
-        imap, up = _resolve_intensity_map(dataset, intensity_map, (Ry, Rx))
-        mvmin, mvmax = _display_limits(imap)
+        imap, up, map_is_rgb = _resolve_intensity_map(dataset, intensity_map, (Ry, Rx))
+        # RGB maps are drawn as-is; scalar maps get percentile display limits.
+        mvmin, mvmax = (0.0, 1.0) if map_is_rgb else _display_limits(imap)
 
         with self.hold_sync():
             self.scan_height = Ry
@@ -412,6 +445,9 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.map_vmin = mvmin
             self.map_vmax = mvmax
             self.map_cmap = map_cmap
+            self.map_is_rgb = bool(map_is_rgb)
+            self.show_inset = bool(show_inset)
+            self.inset_size = max(1, int(inset_size) | 1)  # force odd so a center cell exists
             self.dp_cmap = dp_cmap
             self.dp_vmin = None if vmin_cartesian is None else float(vmin_cartesian)
             self.dp_vmax = None if vmax_cartesian is None else float(vmax_cartesian)
@@ -530,6 +566,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                     norm_power=preset["norm_power"],
                     gaussian_filter_sigma=preset["gaussian_filter_sigma"],
                     zoom=preset["zoom"],
+                    center=source_center,
                 )
 
             dvmin, dvmax = _display_limits(dp)
@@ -597,10 +634,14 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
         ``peak_intensities`` enable the peak overlay, and ``polar_data`` /
         ``polar_peaks`` enable the polar panel. Any are optional.
     intensity_map : ndarray, optional
-        2D real-space map for the left panel (may be upsampled by an integer
-        factor). Defaults to the mean detector intensity per scan position.
+        Real-space map for the left panel (may be upsampled by an integer
+        factor). A 2D ``(H, W)`` array is colormapped via ``map_cmap``; a 3D
+        ``(H, W, 3)`` (or ``(H, W, 4)``) array is drawn as a true RGB(A) image
+        (channels clipped to ``[0, 1]``, ``map_cmap`` ignored). Defaults to the
+        mean detector intensity per scan position.
     map_cmap, dp_cmap : str
-        Colormaps for the intensity map and diffraction pattern.
+        Colormaps for the (scalar) intensity map and diffraction pattern.
+        ``map_cmap`` is ignored when ``intensity_map`` is an RGB image.
     vmin_cartesian, vmax_cartesian : float, optional
         Fixed contrast for the diffraction pattern. ``vmax_cartesian`` defaults
         to 7.0 (matching ``plot_interactive_peak_map``); pass ``None`` for
@@ -609,6 +650,13 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
         Same diffraction-pattern normalization knobs as the matplotlib viewer.
     show_polar : bool, default True
         Show the polar-transform panel when polar data is available.
+    show_inset : bool, default True
+        Show a zoomed ``inset_size`` x ``inset_size`` neighborhood of the
+        intensity map around the selected position, with the central (selected)
+        pixel outlined in green. Stacked under the map; toggleable in the UI.
+    inset_size : int, default 7
+        Side length (in map pixels) of the square inset; forced odd so a single
+        center pixel exists.
     ry, rx : int, optional
         Initial scan position (defaults to the scan center).
 

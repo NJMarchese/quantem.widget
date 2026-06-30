@@ -49,6 +49,30 @@ function colormapToCanvas(
   return off;
 }
 
+// Draw interleaved RGB float data (length w*h*3, channels in [0,1]) directly,
+// bypassing the colormap. Values are scaled to bytes; img.data clamps to [0,255].
+function rgbToCanvas(
+  data: Float32Array, w: number, h: number,
+): HTMLCanvasElement | null {
+  const n = w * h;
+  if (!data.length || w < 1 || h < 1 || data.length < n * 3) return null;
+  const off = document.createElement("canvas");
+  off.width = w;
+  off.height = h;
+  const ctx = off.getContext("2d");
+  if (!ctx) return null;
+  const img = ctx.createImageData(w, h);
+  const out = img.data;
+  for (let i = 0; i < n; i++) {
+    out[i * 4] = data[i * 3] * 255;
+    out[i * 4 + 1] = data[i * 3 + 1] * 255;
+    out[i * 4 + 2] = data[i * 3 + 2] * 255;
+    out[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return off;
+}
+
 interface ImagePanelProps {
   data: Float32Array;
   width: number;
@@ -56,6 +80,8 @@ interface ImagePanelProps {
   cmap: string;
   vmin: number;
   vmax: number;
+  // When true, `data` is interleaved RGB (length w*h*3) drawn without a colormap.
+  isRgb?: boolean;
   displayWidth: number;
   title: string;
   // Pixels-per-data-pixel marker overlay, drawn in NATIVE image coords.
@@ -89,7 +115,7 @@ interface DpView {
 
 function ImagePanel(props: ImagePanelProps) {
   const {
-    data, width, height, cmap, vmin, vmax, displayWidth, title,
+    data, width, height, cmap, vmin, vmax, isRgb, displayWidth, title,
     overlay, onPick, cursor, cursorColor, aspectAuto,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -115,7 +141,9 @@ function ImagePanel(props: ImagePanelProps) {
     ctx.clearRect(0, 0, dispW, dispH);
     ctx.imageSmoothingEnabled = false;
 
-    const off = colormapToCanvas(data, width, height, lutFor(cmap), vmin, vmax);
+    const off = isRgb
+      ? rgbToCanvas(data, width, height)
+      : colormapToCanvas(data, width, height, lutFor(cmap), vmin, vmax);
     const scaleX = dispW / Math.max(1, width);
     const scaleY = dispH / Math.max(1, height);
     if (off) ctx.drawImage(off, 0, 0, dispW, dispH);
@@ -135,7 +163,7 @@ function ImagePanel(props: ImagePanelProps) {
       ctx.arc(cx, cy, 6, 0, 2 * Math.PI);
       ctx.stroke();
     }
-  }, [data, width, height, cmap, vmin, vmax, dispW, dispH, overlay, cursor, cursorColor]);
+  }, [data, width, height, cmap, vmin, vmax, isRgb, dispW, dispH, overlay, cursor, cursorColor]);
 
   const pickFromPointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -259,6 +287,102 @@ function ImagePanel(props: ImagePanelProps) {
   );
 }
 
+// Zoomed NxN neighborhood of the map around the selected pixel, drawn as large
+// cells so individual scan positions are visible. The center (selected) cell gets
+// a green border. Out-of-bounds neighbors (near map edges) stay background-filled.
+interface InsetPanelProps {
+  data: Float32Array;
+  width: number;
+  height: number;
+  cmap: string;
+  vmin: number;
+  vmax: number;
+  isRgb?: boolean;
+  centerCol: number;
+  centerRow: number;
+  size: number;     // NxN window (odd)
+  cellPx?: number;  // displayed px per cell
+  title?: string;
+}
+
+function InsetPanel(props: InsetPanelProps) {
+  const {
+    data, width, height, cmap, vmin, vmax, isRgb,
+    centerCol, centerRow, size, cellPx = 18, title,
+  } = props;
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const n = Math.max(1, size | 0);
+  const half = Math.floor(n / 2);
+  const dim = n * cellPx;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(dim * dpr);
+    canvas.height = Math.round(dim * dpr);
+    canvas.style.width = `${dim}px`;
+    canvas.style.height = `${dim}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#222";  // out-of-bounds backdrop
+    ctx.fillRect(0, 0, dim, dim);
+
+    const lut = isRgb ? null : lutFor(cmap);
+    const range = vmax > vmin ? vmax - vmin : 1;
+    const uniform = !(vmax > vmin);
+    const clamp255 = (x: number) => (x < 0 ? 0 : x > 255 ? 255 : x | 0);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < n; j++) {
+        const col = centerCol - half + j;
+        const row = centerRow - half + i;
+        if (col < 0 || col >= width || row < 0 || row >= height) continue;
+        const idx = row * width + col;
+        let r: number, g: number, b: number;
+        if (isRgb) {
+          if (data.length < (idx + 1) * 3) continue;
+          r = clamp255(data[idx * 3] * 255);
+          g = clamp255(data[idx * 3 + 1] * 255);
+          b = clamp255(data[idx * 3 + 2] * 255);
+        } else if (lut) {
+          if (data.length <= idx) continue;
+          const v = uniform
+            ? 128
+            : Math.min(255, Math.max(0, Math.floor(((data[idx] - vmin) / range) * 255)));
+          r = lut[v * 3]; g = lut[v * 3 + 1]; b = lut[v * 3 + 2];
+        } else {
+          r = 0; g = 0; b = 0;
+        }
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(j * cellPx, i * cellPx, cellPx, cellPx);
+      }
+    }
+    // faint cell grid
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 1;
+    for (let k = 0; k <= n; k++) {
+      ctx.beginPath(); ctx.moveTo(k * cellPx + 0.5, 0); ctx.lineTo(k * cellPx + 0.5, dim); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, k * cellPx + 0.5); ctx.lineTo(dim, k * cellPx + 0.5); ctx.stroke();
+    }
+    // green border on the selected (center) cell
+    ctx.strokeStyle = "#00e000";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(half * cellPx + 1, half * cellPx + 1, cellPx - 2, cellPx - 2);
+  }, [data, width, height, cmap, vmin, vmax, isRgb, centerCol, centerRow, n, half, dim, cellPx]);
+
+  return (
+    <div>
+      {title ? (
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4, fontFamily: "sans-serif" }}>
+          {title}
+        </div>
+      ) : null}
+      <canvas ref={canvasRef} style={{ imageRendering: "pixelated", border: "1px solid #ccc" }} />
+    </div>
+  );
+}
+
 function ShowPolymer4DSTEM() {
   const model = useModel();
   const [scanHeight] = useModelState<number>("scan_height");
@@ -272,7 +396,10 @@ function ShowPolymer4DSTEM() {
   const [mapVmin] = useModelState<number>("map_vmin");
   const [mapVmax] = useModelState<number>("map_vmax");
   const [mapCmap] = useModelState<string>("map_cmap");
+  const [mapIsRgb] = useModelState<boolean>("map_is_rgb");
   const [mapTitle] = useModelState<string>("map_title");
+  const [insetSize] = useModelState<number>("inset_size");
+  const [showInset, setShowInset] = useModelState<boolean>("show_inset");
 
   const [dpCmap] = useModelState<string>("dp_cmap");
   const [dpVmin] = useModelState<number | null>("dp_vmin");
@@ -394,51 +521,6 @@ function ShowPolymer4DSTEM() {
       model.save_changes();
     },
     [upsample, scanHeight, scanWidth, posRy, posRx, model],
-  );
-
-  // Peak overlay on the diffraction pattern (native DP coords -> display).
-  const dpOverlay = useCallback(
-    (ctx: CanvasRenderingContext2D, scaleX: number, scaleY: number) => {
-      // Center / central beam marker (filled).
-      const drawDot = (x: number, y: number, r: number, fill: string) => {
-        ctx.beginPath();
-        ctx.arc((x + 0.5) * scaleX, (y + 0.5) * scaleY, r, 0, 2 * Math.PI);
-        ctx.fillStyle = fill;
-        ctx.fill();
-        ctx.lineWidth = 1.5;
-        ctx.strokeStyle = "#000";
-        ctx.stroke();
-      };
-      if (!showPeaks || !peaksX || peaksX.length === 0) {
-        if (centerX || centerY) drawDot(centerX, centerY, 5, centralColor);
-        return;
-      }
-      // Size non-central peaks by normalized intensity.
-      let imin = Infinity;
-      let imax = -Infinity;
-      for (let i = 0; i < peaksIntensity.length; i++) {
-        if (i === centralIdx) continue;
-        imin = Math.min(imin, peaksIntensity[i]);
-        imax = Math.max(imax, peaksIntensity[i]);
-      }
-      const range = imax > imin ? imax - imin : 1;
-      for (let i = 0; i < peaksX.length; i++) {
-        const px = (peaksX[i] + 0.5) * scaleX;
-        const py = (peaksY[i] + 0.5) * scaleY;
-        if (i === centralIdx) {
-          drawDot(peaksX[i], peaksY[i], 5, centralColor);
-          continue;
-        }
-        const norm = peaksIntensity.length ? (peaksIntensity[i] - imin) / range : 0.5;
-        const r = peakSizeMin + (Number.isFinite(norm) ? norm : 0.5) * (peakSizeMax - peakSizeMin);
-        ctx.beginPath();
-        ctx.arc(px, py, r, 0, 2 * Math.PI);
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = peakColor;
-        ctx.stroke();
-      }
-    },
-    [showPeaks, peaksX, peaksY, peaksIntensity, centralIdx, centerX, centerY, peakColor, centralColor, peakSizeMin, peakSizeMax],
   );
 
   // Polar peaks overlay (r_bin -> x, theta_bin -> y).
@@ -621,21 +703,41 @@ function ShowPolymer4DSTEM() {
         </span>
         {hasPeaks ? checkbox("Show peaks", showPeaks, setShowPeaks) : null}
         {hasPolar ? checkbox("Show polar", showPolar, setShowPolar) : null}
+        {checkbox(`Show ${insetSize || 7}x${insetSize || 7} inset`, showInset, setShowInset)}
       </div>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
-        <ImagePanel
-          data={mapData}
-          width={mapWidth}
-          height={mapHeight}
-          cmap={mapCmap}
-          vmin={mapVmin}
-          vmax={mapVmax}
-          displayWidth={260}
-          title={mapTitle}
-          onPick={handleMapPick}
-          cursor={mapCursor}
-          cursorColor="#ff3b30"
-        />
+        {/* Map + its zoomed inset stacked vertically so the inset never overlaps the map. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-start" }}>
+          <ImagePanel
+            data={mapData}
+            width={mapWidth}
+            height={mapHeight}
+            cmap={mapCmap}
+            vmin={mapVmin}
+            vmax={mapVmax}
+            isRgb={mapIsRgb}
+            displayWidth={260}
+            title={mapTitle}
+            onPick={handleMapPick}
+            cursor={mapCursor}
+            cursorColor="#ff3b30"
+          />
+          {showInset ? (
+            <InsetPanel
+              data={mapData}
+              width={mapWidth}
+              height={mapHeight}
+              cmap={mapCmap}
+              vmin={mapVmin}
+              vmax={mapVmax}
+              isRgb={mapIsRgb}
+              centerCol={mapCursor.col}
+              centerRow={mapCursor.row}
+              size={insetSize || 7}
+              title={`Inset (Ry=${posRy}, Rx=${posRx})`}
+            />
+          ) : null}
+        </div>
         {dpViews.map((view) => (
           <ImagePanel
             key={view.key}
