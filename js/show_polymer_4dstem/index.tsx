@@ -840,8 +840,8 @@ function ShowPolymer4DSTEM() {
     >
       {title ? <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 6 }}>{title}</div> : null}
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
-        {posField(`Rx (X, 0-${Math.max(0, scanWidth - 1)})`, rxInput, setRxInput, scanWidth - 1)}
         {posField(`Ry (Y, 0-${Math.max(0, scanHeight - 1)})`, ryInput, setRyInput, scanHeight - 1)}
+        {posField(`Rx (X, 0-${Math.max(0, scanWidth - 1)})`, rxInput, setRxInput, scanWidth - 1)}
         <span style={{ fontSize: 11, color: "#888" }}>
           click map or use arrow keys (Shift = ×10)
         </span>
