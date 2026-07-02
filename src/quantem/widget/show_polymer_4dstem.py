@@ -293,6 +293,15 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     # Detection threshold, exposed as a live slider in live-inference mode.
     threshold_peak = traitlets.Float(0.5).tag(sync=True)
 
+    # --- Save current position's figures to disk (via save_peak_figures) ---
+    save_dir_base = traitlets.Unicode("").tag(sync=True)          # read-only display
+    save_subfolder = traitlets.Unicode("").tag(sync=True)         # user-editable, nestable ("a/b")
+    save_include_map = traitlets.Bool(True).tag(sync=True)
+    save_include_polar = traitlets.Bool(True).tag(sync=True)
+    save_panels = traitlets.List(traitlets.Unicode()).tag(sync=True)  # which DP panels to save
+    save_request = traitlets.Int(0).tag(sync=True)                # frontend increments to trigger
+    save_status = traitlets.Unicode("").tag(sync=True)            # Python writes result/errors
+
     peak_color = traitlets.Unicode("#ff3b30").tag(sync=True)
     central_color = traitlets.Unicode("#ff3b30").tag(sync=True)
     peak_size_min = traitlets.Float(4.0).tag(sync=True)
@@ -423,6 +432,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         threshold_peak=0.5,
         sigma_peak_blur=1.0,
         infer_device=None,
+        save_dir=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -449,6 +459,15 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         # per-panel display-param edits don't re-fetch or re-run the model.
         self._px = self._py = self._ints = self._r_invA = None
         self._source_center = None
+
+        # Save config: the raw intensity map (for the saved context panel), a title,
+        # and the base output directory.
+        self._intensity_map = intensity_map
+        self._map_title = title or "Intensity Map"
+        self._save_dir = (
+            pathlib.Path(save_dir) if save_dir is not None
+            else pathlib.Path.cwd() / "widget_saves"
+        )
 
         dataset = bragg_peaks.dataset_cartesian
         Ry, Rx = int(dataset.shape[0]), int(dataset.shape[1])
@@ -534,6 +553,8 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.show_polar = has_polar
             self.live_inference = self._live_inference
             self.threshold_peak = float(threshold_peak)
+            self.save_dir_base = str(self._save_dir)
+            self.save_panels = [p["key"] for p in _DP_VIEW_PRESETS]
             self.two_fold_symmetry = bool(two_fold_symmetry)
             if has_polar:
                 self.polar_radial_bins = int(getattr(bragg_peaks, "num_radial_bins", 0) or 0)
@@ -552,6 +573,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self._on_display_change,
             names=["dp_view_sigmas", "dp_view_powers", "dp_view_upper_quantiles", "dp_view_zooms"],
         )
+        self.observe(self._on_save_request, names=["save_request"])
 
     # -- live-kernel recompute ------------------------------------------------
     def _on_pos_change(self, _change):
@@ -561,6 +583,103 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     def _on_display_change(self, _change):
         with self.hold_sync():
             self._recompute_display()
+
+    # -- save current position's figures -------------------------------------
+    def _on_save_request(self, _change):
+        try:
+            self._save_current_position()
+        except Exception as exc:  # surface the failure in the widget UI
+            self.save_status = f"Save failed: {exc}"
+
+    def _save_current_position(self):
+        bp = self._bp
+        ry = max(0, min(int(self.pos_ry), self.scan_height - 1))
+        rx = max(0, min(int(self.pos_rx), self.scan_width - 1))
+
+        sub = (self.save_subfolder or "").strip().strip("/")
+        dest = (self._save_dir / sub / f"ry{ry}_rx{rx}") if sub else (self._save_dir / f"ry{ry}_rx{rx}")
+
+        # In live mode there are no scan-wide peak arrays; inject the cached live peaks.
+        live_kw = {}
+        if self._live_inference:
+            live_kw = dict(
+                peaks_x=self._px, peaks_y=self._py, peak_ints=self._ints, peaks_r_invA=None
+            )
+
+        preset_index = {p["key"]: i for i, p in enumerate(_DP_VIEW_PRESETS)}
+        keys = list(self.save_panels) if self.save_panels else list(preset_index)
+
+        def _panel_kwargs(i):
+            power = self.dp_view_powers[i]
+            return dict(
+                dp_cmap=self.dp_view_cmaps[i],
+                vmin_cartesian=self.dp_view_vmins[i],
+                vmax_cartesian=self.dp_view_vmaxs[i],
+                norm_upper_quantile=self.dp_view_upper_quantiles[i],
+                norm_power=1.0 if power is None else float(power),
+                gaussian_filter_sigma=self.dp_view_sigmas[i],
+                zoom=self.dp_view_zooms[i],
+                selected_peak_color=self.dp_view_colors[i],
+                central_beam_color=self.dp_view_central_colors[i],
+                peak_marker_size=75,
+                crosshair_width_peaks=2,
+                peak_alpha=0.9,
+            )
+
+        n_saved = 0
+        for key in keys:
+            i = preset_index.get(key)
+            if i is None:
+                continue
+            bp.save_peak_figures(
+                ry, rx,
+                intensity_map=self._intensity_map,
+                map_title=self._map_title,
+                prefix=key,
+                save_dir=str(dest),
+                save_intensity_map=False,
+                save_diffraction=True,
+                save_polar=False,
+                **_panel_kwargs(i),
+                **live_kw,
+            )
+            n_saved += 1
+
+        # Context map once (uses the map's own colormap; peaks not drawn on the map).
+        if self.save_include_map:
+            bp.save_peak_figures(
+                ry, rx,
+                intensity_map=self._intensity_map,
+                map_title=self._map_title,
+                prefix="context",
+                save_dir=str(dest),
+                map_cmap=self.map_cmap,
+                save_intensity_map=True,
+                save_diffraction=False,
+                save_polar=False,
+                **live_kw,
+            )
+
+        # Polar once (precomputed mode only; live mode has has_polar=False).
+        if self.save_include_polar and self.has_polar:
+            i = preset_index.get("current", 0)
+            power = self.dp_view_powers[i]
+            bp.save_peak_figures(
+                ry, rx,
+                intensity_map=self._intensity_map,
+                map_title=self._map_title,
+                prefix="polar",
+                save_dir=str(dest),
+                dp_cmap=self.dp_view_cmaps[i],
+                norm_upper_quantile=self.dp_view_upper_quantiles[i],
+                norm_power=1.0 if power is None else float(power),
+                gaussian_filter_sigma=self.dp_view_sigmas[i],
+                save_intensity_map=False,
+                save_diffraction=False,
+                save_polar=True,
+            )
+
+        self.save_status = f"Saved {n_saved} panel(s) to {dest.resolve()}"
 
     def _update_payload(self):
         """Fetch the position-dependent data (base DP + peaks, live or precomputed),

@@ -632,6 +632,14 @@ function ShowPolymer4DSTEM() {
   const [polarDisplayVmin, setPolarDisplayVmin] = useModelState<number | null>("polar_display_vmin");
   const [polarDisplayVmax, setPolarDisplayVmax] = useModelState<number | null>("polar_display_vmax");
 
+  // Save-to-disk config.
+  const [saveDirBase] = useModelState<string>("save_dir_base");
+  const [saveSubfolder, setSaveSubfolder] = useModelState<string>("save_subfolder");
+  const [saveIncludeMap, setSaveIncludeMap] = useModelState<boolean>("save_include_map");
+  const [saveIncludePolar, setSaveIncludePolar] = useModelState<boolean>("save_include_polar");
+  const [savePanels] = useModelState<string[]>("save_panels");
+  const [saveStatus] = useModelState<string>("save_status");
+
   const [dpCurrentBytes] = useModelState<unknown>("dp_current_bytes");
   const [dpCurrentHeight] = useModelState<number>("dp_current_height");
   const [dpCurrentWidth] = useModelState<number>("dp_current_width");
@@ -790,6 +798,19 @@ function ShowPolymer4DSTEM() {
     [],
   );
 
+  // Trigger a save on the kernel: set the selection traits, then bump save_request.
+  const fireSave = useCallback(
+    (panels: string[], includeMap: boolean, includePolar: boolean) => {
+      model.set("save_panels", panels);
+      model.set("save_include_map", includeMap);
+      model.set("save_include_polar", includePolar);
+      model.set("save_status", "Saving…");
+      model.set("save_request", ((model.get("save_request") as number) ?? 0) + 1);
+      model.save_changes();
+    },
+    [model],
+  );
+
   // Root container is focusable so it can receive arrow-key events; clicking the
   // map focuses it so keyboard nav works without an extra tab/click.
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -832,6 +853,7 @@ function ShowPolymer4DSTEM() {
   // (e.g. after a click, drag, or arrow-key move).
   // Which panel's editor modal is open ("current"/"lamellar"/"backbone"/"pipi"/"polar"), or null.
   const [editingPanel, setEditingPanel] = useState<string | null>(null);
+  const [showSaveModal, setShowSaveModal] = useState<boolean>(false);
 
   const [ryInput, setRyInput] = useState<string>(String(posRy));
   const [rxInput, setRxInput] = useState<string>(String(posRx));
@@ -1109,6 +1131,7 @@ function ShowPolymer4DSTEM() {
         onPower={() => {}}
         onQuantile={() => {}}
         onZoom={() => {}}
+        onSave={() => fireSave([], false, true)}
         onClose={() => setEditingPanel(null)}
       />
     );
@@ -1149,11 +1172,94 @@ function ShowPolymer4DSTEM() {
           onPower={(v) => commitPanelTransform("dp_view_powers", dpViewPowers, i, v)}
           onQuantile={(v) => commitPanelTransform("dp_view_upper_quantiles", dpViewUpperQuantiles, i, v)}
           onZoom={(v) => commitPanelTransform("dp_view_zooms", dpViewZooms, i, v)}
+          onSave={() => fireSave([view.key], false, false)}
           onClose={() => setEditingPanel(null)}
         />
       );
     }
   }
+
+  // Save modal: destination + which panels, then fire a save on the kernel.
+  const pathPreview =
+    `${saveDirBase || "widget_saves"}/` +
+    (saveSubfolder ? `${saveSubfolder.replace(/^\/+|\/+$/g, "")}/` : "") +
+    `ry${posRy}_rx${posRx}/`;
+  const saveModal = showSaveModal ? (
+    <div
+      onClick={() => setShowSaveModal(false)}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)",
+        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#fff", borderRadius: 8, padding: 16, minWidth: 380, maxWidth: "92vw",
+          maxHeight: "92vh", overflow: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.3)",
+          fontFamily: "sans-serif", fontSize: 12,
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <span style={{ fontWeight: 700, fontSize: 14 }}>Save figures — Ry={posRy}, Rx={posRx}</span>
+          <button type="button" onClick={() => setShowSaveModal(false)} style={{ cursor: "pointer" }}>Close</button>
+        </div>
+        <div style={{ marginBottom: 6 }}>
+          <span style={{ color: "#555" }}>Base:</span> <code>{saveDirBase || "widget_saves"}</code>
+        </div>
+        <label style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+          Subfolder
+          <input
+            type="text"
+            value={saveSubfolder ?? ""}
+            placeholder="e.g. dataset1/run5"
+            onChange={(e) => setSaveSubfolder(e.target.value)}
+            style={{ flex: 1, fontSize: 12 }}
+          />
+        </label>
+        <div style={{ color: "#777", marginBottom: 10 }}>
+          → <code>{pathPreview}</code>
+        </div>
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontWeight: 600, marginBottom: 4 }}>Panels</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+            {dpViews.map((v) => {
+              const checked = (savePanels ?? []).includes(v.key);
+              return (
+                <label key={v.key} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => {
+                      const set = new Set(savePanels ?? []);
+                      if (set.has(v.key)) set.delete(v.key); else set.add(v.key);
+                      model.set("save_panels", dpViews.map((d) => d.key).filter((k) => set.has(k)));
+                      model.save_changes();
+                    }}
+                  />
+                  {v.title}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 12, marginBottom: 12 }}>
+          {checkbox("Context map", !!saveIncludeMap, setSaveIncludeMap)}
+          {hasPolar ? checkbox("Polar", !!saveIncludePolar, setSaveIncludePolar) : null}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            type="button"
+            onClick={() => fireSave(savePanels ?? [], !!saveIncludeMap, !!saveIncludePolar && hasPolar)}
+            style={{ cursor: "pointer", fontWeight: 600, padding: "4px 12px" }}
+          >
+            Save
+          </button>
+          <span style={{ color: "#555" }}>{saveStatus}</span>
+        </div>
+      </div>
+    </div>
+  ) : null;
 
   return (
     <div
@@ -1172,6 +1278,17 @@ function ShowPolymer4DSTEM() {
         {hasPeaks ? checkbox("Show peaks", showPeaks, setShowPeaks) : null}
         {hasPolar ? checkbox("Show polar", showPolar, setShowPolar) : null}
         {checkbox(`Show ${insetSize || 7}x${insetSize || 7} inset`, showInset, setShowInset)}
+        <button
+          type="button"
+          onClick={() => setShowSaveModal(true)}
+          title="Save this position's panels to disk"
+          style={{
+            fontSize: 12, padding: "2px 10px", cursor: "pointer",
+            border: "1px solid #bbb", borderRadius: 4, background: "#f5f5f5",
+          }}
+        >
+          Save…
+        </button>
         {liveInference ? (
           <label style={{ fontSize: 12, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ color: "#0a7", fontWeight: 600 }}>● live</span>
@@ -1256,6 +1373,7 @@ function ShowPolymer4DSTEM() {
         <div style={{ fontSize: 11, color: "#888", marginTop: 4 }}>No peaks at this scan position.</div>
       ) : null}
       {panelEditor}
+      {saveModal}
     </div>
   );
 }
