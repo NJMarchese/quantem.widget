@@ -482,6 +482,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         threshold_peak=0.5,
         sigma_peak_blur=1.0,
         infer_device=None,
+        scan_mask=None,
         save_dir=None,
         **kwargs,
     ):
@@ -533,13 +534,18 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                     "live_inference=True requires a model on the BraggPeaksPolymer "
                     "(set bragg_peaks.model and load weights first)."
                 )
+            # Restrict normalization + BN adaptation to the sample ROI: an explicit
+            # scan_mask wins, else reuse whatever find_peaks_model stored on the object.
+            mask = scan_mask if scan_mask is not None else getattr(bragg_peaks, "scan_mask", None)
+            if scan_mask is not None and hasattr(type(bragg_peaks), "scan_mask"):
+                bragg_peaks.scan_mask = scan_mask  # keep object + widget in agreement
             # Peaks are produced on the fly; warm the input-normalization cache AND adapt
-            # BatchNorm to this dataset once, so the first cursor move isn't slow and live
-            # (eval-mode) inference is domain-adapted from the start. Polar is a separate
-            # precompute, disabled here.
-            bragg_peaks.ensure_normalization_params(device=infer_device)
+            # BatchNorm to this dataset (over the ROI) once, so the first cursor move isn't
+            # slow and live (eval-mode) inference is domain-adapted from the start. Polar is
+            # a separate precompute, disabled here.
+            bragg_peaks.ensure_normalization_params(device=infer_device, scan_mask=mask)
             if hasattr(bragg_peaks, "adapt_batchnorm"):
-                bragg_peaks.adapt_batchnorm(device=infer_device)
+                bragg_peaks.adapt_batchnorm(device=infer_device, scan_mask=mask)
             has_peaks = True
             has_polar = False
         else:
@@ -968,6 +974,12 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
         (live mode).
     infer_device : str, optional
         Device for live inference (defaults to the ``BraggPeaksPolymer`` device).
+    scan_mask : ndarray, optional
+        Boolean ``(Ry, Rx)`` region-of-interest mask for live-inference normalization +
+        BatchNorm adaptation, so stats come from the sample region (not vacuum/edges). If
+        omitted, reuses the mask ``find_peaks_model`` stored on the object; if none exists,
+        the whole scan is used. Pass e.g. ``scan_mask=mask['mask']`` from
+        ``create_interactive_circular_mask`` when using live mode without ``find_peaks_model``.
 
     Returns
     -------
