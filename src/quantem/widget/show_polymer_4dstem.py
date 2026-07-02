@@ -196,6 +196,12 @@ _DP_VIEW_PRESETS = (
         "cmap": None,
         "color": "#ff3b30",
         "central_color": "#00d5e8",
+        "marker_scaled": True,
+        "marker_size": 8.0,
+        "marker_size_min": 4.0,
+        "marker_size_max": 16.0,
+        "show_central": True,
+        "central_size": 5.0,
         "norm_upper_quantile": None,
         "norm_power": None,
         "gaussian_filter_sigma": None,
@@ -210,6 +216,12 @@ _DP_VIEW_PRESETS = (
         "cmap": "inferno",
         "color": "#ff1f1f",
         "central_color": "#00d5e8",
+        "marker_scaled": True,
+        "marker_size": 8.0,
+        "marker_size_min": 4.0,
+        "marker_size_max": 16.0,
+        "show_central": True,
+        "central_size": 5.0,
         "norm_upper_quantile": 0.9999,
         "norm_power": 1.5,
         "gaussian_filter_sigma": 0.75,
@@ -223,6 +235,12 @@ _DP_VIEW_PRESETS = (
         "cmap": "gray",
         "color": "#7bdc3c",
         "central_color": "#00d5e8",
+        "marker_scaled": True,
+        "marker_size": 8.0,
+        "marker_size_min": 4.0,
+        "marker_size_max": 16.0,
+        "show_central": True,
+        "central_size": 5.0,
         "norm_upper_quantile": 0.9999,
         "norm_power": 1.5,
         "gaussian_filter_sigma": 1.5,
@@ -236,6 +254,12 @@ _DP_VIEW_PRESETS = (
         "cmap": "turbo_black",
         "color": "#ff1f1f",
         "central_color": "#00d5e8",
+        "marker_scaled": True,
+        "marker_size": 8.0,
+        "marker_size_min": 4.0,
+        "marker_size_max": 16.0,
+        "show_central": True,
+        "central_size": 5.0,
         "norm_upper_quantile": 0.9999,
         "norm_power": 1.5,
         "gaussian_filter_sigma": 4.0,
@@ -244,6 +268,22 @@ _DP_VIEW_PRESETS = (
         "vmax": 0.13,
     },
 )
+
+
+def _marker_px_to_mpl_s(radius_px):
+    """Map the widget's on-screen circle radius (px) to matplotlib scatter ``s`` (points^2).
+
+    The live overlay draws circles by pixel radius; ``save_peak_figures`` sizes them by
+    scatter area. ~8 px maps to s=75 (the prior hard-coded save default), i.e.
+    ``s = (radius * 1.08) ** 2``. Screen vs PDF differ in DPI/figsize, so parity is only
+    approximate (a pre-existing display-vs-save limitation).
+    """
+    return float((max(0.0, float(radius_px)) * 1.08) ** 2)
+
+
+def _central_px_to_scaling(radius_px):
+    """Map central-beam radius (px) to ``crosshair_scaling_central_beam`` (s=120*scaling)."""
+    return float(max(0.0, float(radius_px)) / 5.0)
 
 
 class ShowPolymer4DSTEM(anywidget.AnyWidget):
@@ -346,6 +386,16 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     dp_view_cmaps = traitlets.List(traitlets.Unicode()).tag(sync=True)
     dp_view_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
     dp_view_central_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    # Per-panel peak-marker + central-beam-marker controls (display-only; frontend applies
+    # these live and the Save path forwards them to save_peak_figures). marker_scaled=True
+    # sizes peak circles by intensity between marker_size_min/max; False draws them all at
+    # the uniform marker_size. show_central toggles the filled central-beam dot.
+    dp_view_marker_scaled = traitlets.List(traitlets.Bool()).tag(sync=True)
+    dp_view_marker_sizes = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_view_marker_size_mins = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_view_marker_size_maxs = traitlets.List(traitlets.Float()).tag(sync=True)
+    dp_view_show_central = traitlets.List(traitlets.Bool()).tag(sync=True)
+    dp_view_central_sizes = traitlets.List(traitlets.Float()).tag(sync=True)
     # Display-only (frontend applies these live; not observed for recompute):
     dp_view_vmins = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
     dp_view_vmaxs = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
@@ -483,9 +533,13 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                     "live_inference=True requires a model on the BraggPeaksPolymer "
                     "(set bragg_peaks.model and load weights first)."
                 )
-            # Peaks are produced on the fly; warm the normalization cache once so the
-            # first cursor move isn't slow. Polar is a separate precompute, disabled here.
+            # Peaks are produced on the fly; warm the input-normalization cache AND adapt
+            # BatchNorm to this dataset once, so the first cursor move isn't slow and live
+            # (eval-mode) inference is domain-adapted from the start. Polar is a separate
+            # precompute, disabled here.
             bragg_peaks.ensure_normalization_params(device=infer_device)
+            if hasattr(bragg_peaks, "adapt_batchnorm"):
+                bragg_peaks.adapt_batchnorm(device=infer_device)
             has_peaks = True
             has_polar = False
         else:
@@ -517,6 +571,12 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.dp_view_cmaps = [p["cmap"] or dp_cmap for p in _DP_VIEW_PRESETS]
             self.dp_view_colors = [p["color"] for p in _DP_VIEW_PRESETS]
             self.dp_view_central_colors = [p["central_color"] for p in _DP_VIEW_PRESETS]
+            self.dp_view_marker_scaled = [bool(p["marker_scaled"]) for p in _DP_VIEW_PRESETS]
+            self.dp_view_marker_sizes = [float(p["marker_size"]) for p in _DP_VIEW_PRESETS]
+            self.dp_view_marker_size_mins = [float(p["marker_size_min"]) for p in _DP_VIEW_PRESETS]
+            self.dp_view_marker_size_maxs = [float(p["marker_size_max"]) for p in _DP_VIEW_PRESETS]
+            self.dp_view_show_central = [bool(p["show_central"]) for p in _DP_VIEW_PRESETS]
+            self.dp_view_central_sizes = [float(p["central_size"]) for p in _DP_VIEW_PRESETS]
             self.dp_view_vmins = [
                 self.dp_vmin if p["vmin"] is None else float(p["vmin"])
                 for p in _DP_VIEW_PRESETS
@@ -611,7 +671,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
 
         def _panel_kwargs(i):
             power = self.dp_view_powers[i]
-            return dict(
+            kw = dict(
                 dp_cmap=self.dp_view_cmaps[i],
                 vmin_cartesian=self.dp_view_vmins[i],
                 vmax_cartesian=self.dp_view_vmaxs[i],
@@ -621,10 +681,21 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 zoom=self.dp_view_zooms[i],
                 selected_peak_color=self.dp_view_colors[i],
                 central_beam_color=self.dp_view_central_colors[i],
-                peak_marker_size=75,
                 crosshair_width_peaks=2,
                 peak_alpha=0.9,
+                show_central_beam=bool(self.dp_view_show_central[i]),
+                crosshair_scaling_central_beam=_central_px_to_scaling(self.dp_view_central_sizes[i]),
             )
+            # Uniform vs intensity-scaled peak-marker sizing (mirrors the live overlay).
+            if self.dp_view_marker_scaled[i]:
+                kw["peak_marker_size"] = None
+                kw["peak_size_range"] = (
+                    _marker_px_to_mpl_s(self.dp_view_marker_size_mins[i]),
+                    _marker_px_to_mpl_s(self.dp_view_marker_size_maxs[i]),
+                )
+            else:
+                kw["peak_marker_size"] = _marker_px_to_mpl_s(self.dp_view_marker_sizes[i])
+            return kw
 
         n_saved = 0
         for key in keys:
