@@ -288,6 +288,11 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     show_peaks = traitlets.Bool(True).tag(sync=True)
     show_polar = traitlets.Bool(True).tag(sync=True)
 
+    # --- Live inference: run the model on the DP under the cursor on the fly ---
+    live_inference = traitlets.Bool(False).tag(sync=True)
+    # Detection threshold, exposed as a live slider in live-inference mode.
+    threshold_peak = traitlets.Float(0.5).tag(sync=True)
+
     peak_color = traitlets.Unicode("#ff3b30").tag(sync=True)
     central_color = traitlets.Unicode("#ff3b30").tag(sync=True)
     peak_size_min = traitlets.Float(4.0).tag(sync=True)
@@ -402,6 +407,10 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         title="",
         ry=None,
         rx=None,
+        live_inference=False,
+        threshold_peak=0.5,
+        sigma_peak_blur=1.0,
+        infer_device=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -419,6 +428,11 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         self._norm_upper_quantile = norm_upper_quantile
         self._norm_power = float(norm_power)
 
+        # Live-inference config.
+        self._live_inference = bool(live_inference)
+        self._infer_device = infer_device
+        self._sigma_peak_blur = float(sigma_peak_blur)
+
         dataset = bragg_peaks.dataset_cartesian
         Ry, Rx = int(dataset.shape[0]), int(dataset.shape[1])
 
@@ -427,8 +441,20 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         polar_data = getattr(bragg_peaks, "polar_data", None)
         polar_peaks = getattr(bragg_peaks, "polar_peaks", None)
 
-        has_peaks = peak_coords is not None
-        has_polar = bool(show_polar and polar_data is not None)
+        if self._live_inference:
+            if getattr(bragg_peaks, "model", None) is None:
+                raise ValueError(
+                    "live_inference=True requires a model on the BraggPeaksPolymer "
+                    "(set bragg_peaks.model and load weights first)."
+                )
+            # Peaks are produced on the fly; warm the normalization cache once so the
+            # first cursor move isn't slow. Polar is a separate precompute, disabled here.
+            bragg_peaks.ensure_normalization_params(device=infer_device)
+            has_peaks = True
+            has_polar = False
+        else:
+            has_peaks = peak_coords is not None
+            has_polar = bool(show_polar and polar_data is not None)
 
         imap, up, map_is_rgb = _resolve_intensity_map(dataset, intensity_map, (Ry, Rx))
         # RGB maps are drawn as-is; scalar maps get percentile display limits.
@@ -467,6 +493,8 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.has_polar = has_polar
             self.show_peaks = has_peaks
             self.show_polar = has_polar
+            self.live_inference = self._live_inference
+            self.threshold_peak = float(threshold_peak)
             self.two_fold_symmetry = bool(two_fold_symmetry)
             if has_polar:
                 self.polar_radial_bins = int(getattr(bragg_peaks, "num_radial_bins", 0) or 0)
@@ -478,7 +506,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.pos_rx = Rx // 2 if rx is None else int(rx)
             self._update_payload()
 
-        self.observe(self._on_pos_change, names=["pos_ry", "pos_rx"])
+        self.observe(self._on_pos_change, names=["pos_ry", "pos_rx", "threshold_peak"])
 
     # -- live-kernel recompute ------------------------------------------------
     def _on_pos_change(self, _change):
@@ -514,7 +542,23 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         self.center_y, self.center_x = float(center[0]), float(center[1])
 
         px = py = ints = r_invA = None
-        if self.has_peaks:
+        if self._live_inference:
+            # Run the model on this single DP; no precomputed peaks / polar peaks.
+            res = bp.infer_peaks_single(
+                ry,
+                rx,
+                device=self._infer_device,
+                sigma_peak_blur=self._sigma_peak_blur,
+                threshold_peak=float(self.threshold_peak),
+            )
+            px = res["x_pixels"]
+            py = res["y_pixels"]
+            ints = res["intensities"]
+            self.peaks_x = _as_float_list(px)
+            self.peaks_y = _as_float_list(py)
+            self.peaks_intensity = _as_float_list(ints)
+            self.central_idx = _central_peak_index(px, py, r_invA, center)
+        elif self.has_peaks:
             px = bp.peak_coordinates_cartesian["x_pixels"][ry, rx]
             py = bp.peak_coordinates_cartesian["y_pixels"][ry, rx]
             if getattr(bp, "peak_intensities", None) is not None:
@@ -659,6 +703,20 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
         center pixel exists.
     ry, rx : int, optional
         Initial scan position (defaults to the scan center).
+    live_inference : bool, default False
+        Run the model on the diffraction pattern under the cursor on the fly
+        (via ``bragg_peaks.infer_peaks_single``) instead of reading precomputed
+        ``peak_coordinates_cartesian``. Requires ``bragg_peaks.model`` (with loaded
+        weights). Peaks update live as you drag; the polar panel is disabled in this
+        mode. Does not require having run ``find_peaks_model`` first.
+    threshold_peak : float, default 0.5
+        Peak-detection threshold. In live mode this is exposed as a slider that
+        re-runs detection on the current pattern instantly.
+    sigma_peak_blur : float, default 1.0
+        Gaussian blur sigma applied to the model's position map before peak detection
+        (live mode).
+    infer_device : str, optional
+        Device for live inference (defaults to the ``BraggPeaksPolymer`` device).
 
     Returns
     -------

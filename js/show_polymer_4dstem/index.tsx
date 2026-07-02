@@ -410,6 +410,11 @@ function ShowPolymer4DSTEM() {
   const [showPeaks, setShowPeaks] = useModelState<boolean>("show_peaks");
   const [showPolar, setShowPolar] = useModelState<boolean>("show_polar");
 
+  const [liveInference] = useModelState<boolean>("live_inference");
+  // Read-only here; the slider writes via model.set (through the throttle), not this setter,
+  // so slider drags don't each trigger their own save_changes.
+  const [thresholdPeak] = useModelState<number>("threshold_peak");
+
   const [peakColor] = useModelState<string>("peak_color");
   const [centralColor] = useModelState<string>("central_color");
   const [peakSizeMin] = useModelState<number>("peak_size_min");
@@ -515,20 +520,21 @@ function ShowPolymer4DSTEM() {
   // one per pixel during a drag floods the single-threaded kernel and builds a
   // backlog (the ~0.5 s DP lag). Instead we keep at most one request in flight,
   // coalescing intermediate positions and always sending the final one.
-  const pendingPosRef = useRef<{ ry: number; rx: number } | null>(null);
-  const lastSentRef = useRef<{ ry: number; rx: number } | null>(null);
+  // Coalesce recomputes by a *signature* of every kernel-recompute-affecting value
+  // (position + threshold + — in Phase 2 — the per-panel transform params). Callers
+  // set the relevant traits on the model, then call requestRecompute(sig); at most one
+  // save_changes() is in flight, and the trailing state is always flushed afterward.
+  const pendingSigRef = useRef<string | null>(null);
+  const lastSentSigRef = useRef<string | null>(null);
   const inFlightRef = useRef(false);
   const watchdogRef = useRef<number | null>(null);
   const firstSeqRef = useRef(true);
 
-  // Flush the latest pending position to the kernel, if newer than the last sent.
   const flushPending = useCallback(() => {
-    const p = pendingPosRef.current;
-    if (!p) return;
-    const last = lastSentRef.current;
-    if (last && last.ry === p.ry && last.rx === p.rx) return;
+    const sig = pendingSigRef.current;
+    if (sig == null || lastSentSigRef.current === sig) return;
     inFlightRef.current = true;
-    lastSentRef.current = p;
+    lastSentSigRef.current = sig;
     if (watchdogRef.current != null) clearTimeout(watchdogRef.current);
     // Safety net: if a recompute response is ever lost, don't stall forever.
     watchdogRef.current = window.setTimeout(() => {
@@ -536,12 +542,22 @@ function ShowPolymer4DSTEM() {
       inFlightRef.current = false;
       flushPending();
     }, 3000);
-    model.save_changes(); // flushes the pos_ry/pos_rx already set on the model
+    model.save_changes(); // flushes the traits already set on the model
   }, [model]);
+
+  const requestRecompute = useCallback(
+    (sig: string) => {
+      pendingSigRef.current = sig;
+      // Only kick a kernel recompute if none is in flight; otherwise the trailing
+      // flush (on the next payload response) will pick up this latest state.
+      if (!inFlightRef.current) flushPending();
+    },
+    [flushPending],
+  );
 
   // Single entry point for every position change (map click/drag, arrow keys,
   // typed X/Y): clamp to the scan grid, update the model locally so the crosshair
-  // + inset track immediately, then coalesce kernel recomputes via flushPending.
+  // + inset track immediately, then coalesce kernel recomputes.
   const commitPosition = useCallback(
     (ry: number, rx: number) => {
       const nextRy = Math.max(0, Math.min(scanHeight - 1, Math.round(ry)));
@@ -549,12 +565,19 @@ function ShowPolymer4DSTEM() {
       if (nextRy === posRy && nextRx === posRx) return;
       model.set("pos_ry", nextRy);
       model.set("pos_rx", nextRx);
-      pendingPosRef.current = { ry: nextRy, rx: nextRx };
-      // Only kick a kernel recompute if none is in flight; otherwise the trailing
-      // flush (on the next payload response) will pick up this latest position.
-      if (!inFlightRef.current) flushPending();
+      requestRecompute(`p:${nextRy},${nextRx}|t:${thresholdPeak}`);
     },
-    [scanHeight, scanWidth, posRy, posRx, model, flushPending],
+    [scanHeight, scanWidth, posRy, posRx, thresholdPeak, model, requestRecompute],
+  );
+
+  // Threshold slider (live-inference mode): update the model locally so the label
+  // tracks instantly, and coalesce the kernel re-detection through the same throttle.
+  const commitThreshold = useCallback(
+    (v: number) => {
+      model.set("threshold_peak", v);
+      requestRecompute(`p:${posRy},${posRx}|t:${v}`);
+    },
+    [posRy, posRx, model, requestRecompute],
   );
 
   // Root container is focusable so it can receive arrow-key events; clicking the
@@ -848,6 +871,21 @@ function ShowPolymer4DSTEM() {
         {hasPeaks ? checkbox("Show peaks", showPeaks, setShowPeaks) : null}
         {hasPolar ? checkbox("Show polar", showPolar, setShowPolar) : null}
         {checkbox(`Show ${insetSize || 7}x${insetSize || 7} inset`, showInset, setShowInset)}
+        {liveInference ? (
+          <label style={{ fontSize: 12, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ color: "#0a7", fontWeight: 600 }}>● live</span>
+            Threshold: {(thresholdPeak ?? 0.5).toFixed(2)}
+            <input
+              type="range"
+              min={0.05}
+              max={0.95}
+              step={0.01}
+              value={thresholdPeak ?? 0.5}
+              onChange={(e) => commitThreshold(parseFloat(e.target.value))}
+              style={{ width: 120 }}
+            />
+          </label>
+        ) : null}
       </div>
       <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
         {/* Map + its zoomed inset stacked vertically so the inset never overlaps the map. */}
