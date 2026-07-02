@@ -337,8 +337,20 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     dp_view_cmaps = traitlets.List(traitlets.Unicode()).tag(sync=True)
     dp_view_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
     dp_view_central_colors = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    # Display-only (frontend applies these live; not observed for recompute):
     dp_view_vmins = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
     dp_view_vmaxs = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+    # Data-transform params (per DP panel). Editing these triggers a Python recompute
+    # of that panel's float bytes (see _recompute_display); no model re-run.
+    dp_view_sigmas = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+    dp_view_powers = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+    dp_view_upper_quantiles = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+    dp_view_zooms = traitlets.List(traitlets.Float(allow_none=True), allow_none=False).tag(sync=True)
+
+    # Polar display-only overrides (empty/NaN sentinel = use auto). Applied on frontend.
+    polar_cmap = traitlets.Unicode("").tag(sync=True)
+    polar_display_vmin = traitlets.Float(None, allow_none=True).tag(sync=True)
+    polar_display_vmax = traitlets.Float(None, allow_none=True).tag(sync=True)
 
     dp_current_bytes = traitlets.Bytes(b"").tag(sync=True)
     dp_current_height = traitlets.Int(1).tag(sync=True)
@@ -433,6 +445,11 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         self._infer_device = infer_device
         self._sigma_peak_blur = float(sigma_peak_blur)
 
+        # Cached per-position peaks + center, reused by _recompute_display so that
+        # per-panel display-param edits don't re-fetch or re-run the model.
+        self._px = self._py = self._ints = self._r_invA = None
+        self._source_center = None
+
         dataset = bragg_peaks.dataset_cartesian
         Ry, Rx = int(dataset.shape[0]), int(dataset.shape[1])
 
@@ -489,6 +506,28 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 self.dp_vmax if p["vmax"] is None else float(p["vmax"])
                 for p in _DP_VIEW_PRESETS
             ]
+            # Per-panel transform params. The "current" panel is seeded from the
+            # widget-level norm settings (its preset leaves them None); the rest use
+            # their preset values. These become editable via the per-panel modal.
+            def _panel_qtl(p):
+                return self._norm_upper_quantile if p["key"] == "current" else p["norm_upper_quantile"]
+
+            def _panel_power(p):
+                return self._norm_power if p["key"] == "current" else p["norm_power"]
+
+            self.dp_view_sigmas = [
+                None if p["gaussian_filter_sigma"] is None else float(p["gaussian_filter_sigma"])
+                for p in _DP_VIEW_PRESETS
+            ]
+            self.dp_view_powers = [
+                None if _panel_power(p) is None else float(_panel_power(p))
+                for p in _DP_VIEW_PRESETS
+            ]
+            self.dp_view_upper_quantiles = [
+                None if _panel_qtl(p) is None else float(_panel_qtl(p))
+                for p in _DP_VIEW_PRESETS
+            ]
+            self.dp_view_zooms = [float(p["zoom"]) for p in _DP_VIEW_PRESETS]
             self.has_peaks = has_peaks
             self.has_polar = has_polar
             self.show_peaks = has_peaks
@@ -507,13 +546,25 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self._update_payload()
 
         self.observe(self._on_pos_change, names=["pos_ry", "pos_rx", "threshold_peak"])
+        # Per-panel transform-param edits only need a display recompute (no re-fetch /
+        # no model re-run). vmin/vmax/cmap are display-only (frontend applies them).
+        self.observe(
+            self._on_display_change,
+            names=["dp_view_sigmas", "dp_view_powers", "dp_view_upper_quantiles", "dp_view_zooms"],
+        )
 
     # -- live-kernel recompute ------------------------------------------------
     def _on_pos_change(self, _change):
         with self.hold_sync():
             self._update_payload()
 
+    def _on_display_change(self, _change):
+        with self.hold_sync():
+            self._recompute_display()
+
     def _update_payload(self):
+        """Fetch the position-dependent data (base DP + peaks, live or precomputed),
+        cache the peaks, then render the panels via _recompute_display."""
         bp = self._bp
         dataset = bp.dataset_cartesian
         ry = max(0, min(int(self.pos_ry), self.scan_height - 1))
@@ -533,12 +584,10 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         self.dp_data_vmin = base_vmin
         self.dp_data_vmax = base_vmax
 
-        source_center = _display_center(
-            getattr(bp, "image_centers", None), ry, rx, base_dp.shape
-        )
         center = _display_center(
             getattr(bp, "image_centers", None), ry, rx, base_dp.shape
         )
+        self._source_center = center
         self.center_y, self.center_x = float(center[0]), float(center[1])
 
         px = py = ints = r_invA = None
@@ -551,13 +600,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 sigma_peak_blur=self._sigma_peak_blur,
                 threshold_peak=float(self.threshold_peak),
             )
-            px = res["x_pixels"]
-            py = res["y_pixels"]
-            ints = res["intensities"]
-            self.peaks_x = _as_float_list(px)
-            self.peaks_y = _as_float_list(py)
-            self.peaks_intensity = _as_float_list(ints)
-            self.central_idx = _central_peak_index(px, py, r_invA, center)
+            px, py, ints = res["x_pixels"], res["y_pixels"], res["intensities"]
         elif self.has_peaks:
             px = bp.peak_coordinates_cartesian["x_pixels"][ry, rx]
             py = bp.peak_coordinates_cartesian["y_pixels"][ry, rx]
@@ -565,6 +608,12 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 ints = bp.peak_intensities[self._intensity_field][ry, rx]
             if getattr(bp, "polar_peaks", None) is not None:
                 r_invA = bp.polar_peaks["r_invA"][ry, rx]
+
+        # Cache the peaks so per-panel display-param edits can re-render without
+        # re-fetching / re-running the model.
+        self._px, self._py, self._ints, self._r_invA = px, py, ints, r_invA
+
+        if px is not None and len(_as_float_list(px)) > 0:
             self.peaks_x = _as_float_list(px)
             self.peaks_y = _as_float_list(py)
             self.peaks_intensity = _as_float_list(ints)
@@ -573,7 +622,25 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.peaks_x, self.peaks_y, self.peaks_intensity = [], [], []
             self.central_idx = -1
 
-        self._update_dp_views(dataset, ry, rx, px, py, ints, r_invA, source_center)
+        self._recompute_display()
+
+    def _recompute_display(self):
+        """Rebuild the DP-view panels (and polar image) from the cached peaks + the
+        current per-panel display params. Does NOT re-run inference or re-read peaks,
+        so it's cheap enough to fire on every transform-param slider tick."""
+        bp = self._bp
+        dataset = bp.dataset_cartesian
+        ry = max(0, min(int(self.pos_ry), self.scan_height - 1))
+        rx = max(0, min(int(self.pos_rx), self.scan_width - 1))
+        source_center = getattr(self, "_source_center", None)
+        if source_center is None:
+            source_center = _display_center(
+                getattr(bp, "image_centers", None), ry, rx, (self.dp_height, self.dp_width)
+            )
+
+        self._update_dp_views(
+            dataset, ry, rx, self._px, self._py, self._ints, self._r_invA, source_center
+        )
 
         if self.has_polar:
             polar = np.asarray(
@@ -590,28 +657,22 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         self.payload_seq += 1
 
     def _update_dp_views(self, dataset, ry, rx, px, py, ints, r_invA, source_center):
-        for preset in _DP_VIEW_PRESETS:
+        for i, preset in enumerate(_DP_VIEW_PRESETS):
             key = preset["key"]
-            if key == "current":
-                dp = _normalized_dp(
-                    dataset,
-                    ry,
-                    rx,
-                    norm_upper_quantile=self._norm_upper_quantile,
-                    norm_power=self._norm_power,
-                )
-                x0 = y0 = 0
-            else:
-                dp, x0, y0 = _dp_view(
-                    dataset,
-                    ry,
-                    rx,
-                    norm_upper_quantile=preset["norm_upper_quantile"],
-                    norm_power=preset["norm_power"],
-                    gaussian_filter_sigma=preset["gaussian_filter_sigma"],
-                    zoom=preset["zoom"],
-                    center=source_center,
-                )
+            # Per-panel transform params come from the (editable) trait lists, not the
+            # frozen presets. zoom=1 + sigma=None reduces _dp_view to plain normalization
+            # (so the "current" panel matches its old behavior until the user edits it).
+            power = self.dp_view_powers[i]
+            dp, x0, y0 = _dp_view(
+                dataset,
+                ry,
+                rx,
+                norm_upper_quantile=self.dp_view_upper_quantiles[i],
+                norm_power=1.0 if power is None else float(power),
+                gaussian_filter_sigma=self.dp_view_sigmas[i],
+                zoom=self.dp_view_zooms[i],
+                center=source_center,
+            )
 
             dvmin, dvmax = _display_limits(dp)
             setattr(self, f"dp_{key}_bytes", np.ascontiguousarray(dp, dtype=np.float32).tobytes())

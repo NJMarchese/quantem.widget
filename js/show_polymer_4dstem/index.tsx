@@ -90,6 +90,8 @@ interface ImagePanelProps {
   cursor?: { col: number; row: number } | null;
   cursorColor?: string;
   aspectAuto?: boolean;
+  // When provided, an "Adjust" button is shown next to the title to open the editor.
+  onAdjust?: () => void;
 }
 
 interface DpView {
@@ -116,7 +118,7 @@ interface DpView {
 function ImagePanel(props: ImagePanelProps) {
   const {
     data, width, height, cmap, vmin, vmax, isRgb, displayWidth, title,
-    overlay, onPick, cursor, cursorColor, aspectAuto,
+    overlay, onPick, cursor, cursorColor, aspectAuto, onAdjust,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const isPickingRef = useRef(false);
@@ -264,7 +266,22 @@ function ImagePanel(props: ImagePanelProps) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
-      <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4, fontFamily: "sans-serif" }}>{title}</div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+        <span style={{ fontSize: 12, fontWeight: 600, fontFamily: "sans-serif" }}>{title}</span>
+        {onAdjust ? (
+          <button
+            type="button"
+            onClick={onAdjust}
+            title="Adjust display settings"
+            style={{
+              fontSize: 11, lineHeight: 1, padding: "2px 6px", cursor: "pointer",
+              border: "1px solid #bbb", borderRadius: 4, background: "#f5f5f5",
+            }}
+          >
+            ⚙ Adjust
+          </button>
+        ) : null}
+      </div>
       <canvas
         ref={canvasRef}
         onPointerDown={onPick ? handlePointerDown : undefined}
@@ -383,6 +400,157 @@ function InsetPanel(props: InsetPanelProps) {
   );
 }
 
+// Colormap choices for the per-panel editor dropdown.
+const CMAP_OPTIONS = Object.keys(COLORMAPS);
+
+// One labeled slider + number input row. `nullable` adds an "auto" button that clears
+// the value (null = use auto / no transform).
+function EditorRow(props: {
+  label: string;
+  value: number | null;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number | null) => void;
+  nullable?: boolean;
+}) {
+  const { label, value, min, max, step, onChange, nullable } = props;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "6px 0", fontSize: 12 }}>
+      <span style={{ width: 110 }}>{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value == null ? min : value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{ flex: 1 }}
+      />
+      <input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={value == null ? "" : value}
+        placeholder={nullable ? "auto" : ""}
+        onChange={(e) => {
+          const s = e.target.value;
+          if (s === "") { onChange(nullable ? null : min); return; }
+          const v = parseFloat(s);
+          if (Number.isFinite(v)) onChange(v);
+        }}
+        style={{ width: 64 }}
+      />
+      {nullable ? (
+        <button
+          type="button"
+          onClick={() => onChange(null)}
+          title="Auto / none"
+          style={{ fontSize: 10, padding: "1px 5px", cursor: "pointer" }}
+        >
+          auto
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+interface PanelEditorProps {
+  title: string;
+  isPolar: boolean;
+  preview: React.ReactNode;
+  cmap: string;
+  vmin: number | null;
+  vmax: number | null;
+  dataVmin: number;
+  dataVmax: number;
+  sigma: number | null;
+  power: number | null;
+  upperQuantile: number | null;
+  zoom: number | null;
+  onCmap: (v: string) => void;
+  onVmin: (v: number | null) => void;
+  onVmax: (v: number | null) => void;
+  onSigma: (v: number | null) => void;
+  onPower: (v: number | null) => void;
+  onQuantile: (v: number | null) => void;
+  onZoom: (v: number | null) => void;
+  onSave?: () => void;
+  onClose: () => void;
+}
+
+// Modal overlay: large preview of one panel + its display controls. Display-only
+// controls (colormap / vmin / vmax) re-render instantly; the transform controls
+// (sigma / power / quantile / zoom) recompute the panel in the kernel.
+function PanelEditor(props: PanelEditorProps) {
+  const {
+    title, isPolar, preview, cmap, vmin, vmax, dataVmin, dataVmax,
+    sigma, power, upperQuantile, zoom,
+    onCmap, onVmin, onVmax, onSigma, onPower, onQuantile, onZoom, onSave, onClose,
+  } = props;
+  const vspan = Math.max(1e-6, dataVmax - dataVmin || 1);
+  const vlo = dataVmin - vspan;
+  const vhi = dataVmax + vspan;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)",
+        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#fff", borderRadius: 8, padding: 16, maxWidth: "92vw", maxHeight: "92vh",
+          overflow: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.3)", display: "flex", gap: 16,
+          fontFamily: "sans-serif", alignItems: "flex-start",
+        }}
+      >
+        <div>{preview}</div>
+        <div style={{ minWidth: 300 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+            <span style={{ fontWeight: 700, fontSize: 14 }}>Adjust: {title}</span>
+            <div style={{ display: "flex", gap: 6 }}>
+              {onSave ? (
+                <button type="button" onClick={onSave} title="Save this panel to disk"
+                  style={{ cursor: "pointer" }}>Save this panel</button>
+              ) : null}
+              <button type="button" onClick={onClose} style={{ cursor: "pointer" }}>Done</button>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "6px 0", fontSize: 12 }}>
+            <span style={{ width: 110 }}>Colormap</span>
+            <select value={cmap} onChange={(e) => onCmap(e.target.value)} style={{ flex: 1 }}>
+              {CMAP_OPTIONS.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <EditorRow label="vmin" value={vmin} min={vlo} max={vhi} step={vspan / 200} onChange={onVmin} nullable />
+          <EditorRow label="vmax" value={vmax} min={vlo} max={vhi} step={vspan / 200} onChange={onVmax} nullable />
+          {!isPolar ? (
+            <>
+              <EditorRow label="sigma blur" value={sigma} min={0} max={8} step={0.05} onChange={onSigma} nullable />
+              <EditorRow label="power law" value={power} min={0.1} max={3} step={0.05} onChange={onPower} />
+              <EditorRow label="upper quantile" value={upperQuantile} min={0.9} max={1} step={0.0001} onChange={onQuantile} nullable />
+              <EditorRow label="zoom" value={zoom} min={1} max={8} step={0.25} onChange={onZoom} />
+              <div style={{ fontSize: 10, color: "#888", marginTop: 6 }}>
+                sigma / power / quantile / zoom recompute the panel in the kernel; colormap / vmin / vmax are instant.
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 10, color: "#888", marginTop: 6 }}>
+              Polar panel: display-only controls.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ShowPolymer4DSTEM() {
   const model = useModel();
   const [scanHeight] = useModelState<number>("scan_height");
@@ -446,11 +614,23 @@ function ShowPolymer4DSTEM() {
   const [polarPeaksTheta] = useModelState<number[]>("polar_peaks_theta_bin");
 
   const [dpViewTitles] = useModelState<string[]>("dp_view_titles");
-  const [dpViewCmaps] = useModelState<string[]>("dp_view_cmaps");
+  // Display-only params (cmap/vmin/vmax): setters re-render locally + persist to
+  // Python (which ignores them — no recompute).
+  const [dpViewCmaps, setDpViewCmaps] = useModelState<string[]>("dp_view_cmaps");
   const [dpViewColors] = useModelState<string[]>("dp_view_colors");
   const [dpViewCentralColors] = useModelState<string[]>("dp_view_central_colors");
-  const [dpViewVmins] = useModelState<Array<number | null>>("dp_view_vmins");
-  const [dpViewVmaxs] = useModelState<Array<number | null>>("dp_view_vmaxs");
+  const [dpViewVmins, setDpViewVmins] = useModelState<Array<number | null>>("dp_view_vmins");
+  const [dpViewVmaxs, setDpViewVmaxs] = useModelState<Array<number | null>>("dp_view_vmaxs");
+  // Data-transform params (sigma/power/upper-quantile/zoom): editing these must trigger
+  // a Python recompute (routed through the throttle), so write via model.set, not here.
+  const [dpViewSigmas] = useModelState<Array<number | null>>("dp_view_sigmas");
+  const [dpViewPowers] = useModelState<Array<number | null>>("dp_view_powers");
+  const [dpViewUpperQuantiles] = useModelState<Array<number | null>>("dp_view_upper_quantiles");
+  const [dpViewZooms] = useModelState<Array<number | null>>("dp_view_zooms");
+  // Polar display-only overrides.
+  const [polarCmap, setPolarCmap] = useModelState<string>("polar_cmap");
+  const [polarDisplayVmin, setPolarDisplayVmin] = useModelState<number | null>("polar_display_vmin");
+  const [polarDisplayVmax, setPolarDisplayVmax] = useModelState<number | null>("polar_display_vmax");
 
   const [dpCurrentBytes] = useModelState<unknown>("dp_current_bytes");
   const [dpCurrentHeight] = useModelState<number>("dp_current_height");
@@ -545,15 +725,23 @@ function ShowPolymer4DSTEM() {
     model.save_changes(); // flushes the traits already set on the model
   }, [model]);
 
-  const requestRecompute = useCallback(
-    (sig: string) => {
-      pendingSigRef.current = sig;
-      // Only kick a kernel recompute if none is in flight; otherwise the trailing
-      // flush (on the next payload response) will pick up this latest state.
-      if (!inFlightRef.current) flushPending();
-    },
-    [flushPending],
-  );
+  // Signature over every kernel-recompute-affecting trait, read straight off the model
+  // (model.set updates it synchronously, so callers just set traits then call this).
+  const recomputeSig = useCallback(() => {
+    const g = (n: string) => JSON.stringify(model.get(n));
+    return [
+      g("pos_ry"), g("pos_rx"), g("threshold_peak"),
+      g("dp_view_sigmas"), g("dp_view_powers"),
+      g("dp_view_upper_quantiles"), g("dp_view_zooms"),
+    ].join("|");
+  }, [model]);
+
+  const requestRecompute = useCallback(() => {
+    pendingSigRef.current = recomputeSig();
+    // Only kick a kernel recompute if none is in flight; otherwise the trailing
+    // flush (on the next payload response) will pick up this latest state.
+    if (!inFlightRef.current) flushPending();
+  }, [recomputeSig, flushPending]);
 
   // Single entry point for every position change (map click/drag, arrow keys,
   // typed X/Y): clamp to the scan grid, update the model locally so the crosshair
@@ -565,9 +753,9 @@ function ShowPolymer4DSTEM() {
       if (nextRy === posRy && nextRx === posRx) return;
       model.set("pos_ry", nextRy);
       model.set("pos_rx", nextRx);
-      requestRecompute(`p:${nextRy},${nextRx}|t:${thresholdPeak}`);
+      requestRecompute();
     },
-    [scanHeight, scanWidth, posRy, posRx, thresholdPeak, model, requestRecompute],
+    [scanHeight, scanWidth, posRy, posRx, model, requestRecompute],
   );
 
   // Threshold slider (live-inference mode): update the model locally so the label
@@ -575,9 +763,31 @@ function ShowPolymer4DSTEM() {
   const commitThreshold = useCallback(
     (v: number) => {
       model.set("threshold_peak", v);
-      requestRecompute(`p:${posRy},${posRx}|t:${v}`);
+      requestRecompute();
     },
-    [posRy, posRx, model, requestRecompute],
+    [model, requestRecompute],
+  );
+
+  // Set one entry of a per-panel transform list and trigger a coalesced recompute.
+  const commitPanelTransform = useCallback(
+    (traitName: string, current: Array<number | null> | undefined, idx: number, v: number | null) => {
+      const next = [...(current ?? [])];
+      next[idx] = v;
+      model.set(traitName, next);
+      requestRecompute();
+    },
+    [model, requestRecompute],
+  );
+
+  // Set one entry of a per-panel display-only list (cmap/vmin/vmax): re-renders locally
+  // and persists to Python without a recompute.
+  const setPanelDisplay = useCallback(
+    <T,>(setter: (v: T[]) => void, current: T[] | undefined, idx: number, v: T) => {
+      const next = [...(current ?? [])];
+      next[idx] = v;
+      setter(next);
+    },
+    [],
   );
 
   // Root container is focusable so it can receive arrow-key events; clicking the
@@ -620,6 +830,9 @@ function ShowPolymer4DSTEM() {
   // Editable X (Rx) / Y (Ry) text fields. Local string state lets the user type
   // freely; we re-sync from the model whenever the committed position changes
   // (e.g. after a click, drag, or arrow-key move).
+  // Which panel's editor modal is open ("current"/"lamellar"/"backbone"/"pipi"/"polar"), or null.
+  const [editingPanel, setEditingPanel] = useState<string | null>(null);
+
   const [ryInput, setRyInput] = useState<string>(String(posRy));
   const [rxInput, setRxInput] = useState<string>(String(posRx));
   useEffect(() => { setRyInput(String(posRy)); }, [posRy]);
@@ -854,6 +1067,94 @@ function ShowPolymer4DSTEM() {
     </label>
   );
 
+  // Effective polar display params (overrides win; empty/null => auto).
+  const effPolarCmap = polarCmap && polarCmap.length ? polarCmap : dpCmap;
+  const effPolarVmin = polarDisplayVmin == null ? polarVmin : polarDisplayVmin;
+  const effPolarVmax = polarDisplayVmax == null ? polarVmax : polarDisplayVmax;
+
+  // Build the per-panel editor modal for the panel currently being edited.
+  let panelEditor: React.ReactNode = null;
+  if (editingPanel === "polar") {
+    panelEditor = (
+      <PanelEditor
+        title="Polar"
+        isPolar
+        preview={
+          <ImagePanel
+            data={polarData}
+            width={polarWidth}
+            height={polarHeight}
+            cmap={effPolarCmap}
+            vmin={effPolarVmin}
+            vmax={effPolarVmax}
+            displayWidth={480}
+            title="Polar (preview)"
+            overlay={polarOverlay}
+            aspectAuto
+          />
+        }
+        cmap={effPolarCmap}
+        vmin={polarDisplayVmin}
+        vmax={polarDisplayVmax}
+        dataVmin={polarVmin}
+        dataVmax={polarVmax}
+        sigma={null}
+        power={null}
+        upperQuantile={null}
+        zoom={null}
+        onCmap={(v) => setPolarCmap(v)}
+        onVmin={(v) => setPolarDisplayVmin(v)}
+        onVmax={(v) => setPolarDisplayVmax(v)}
+        onSigma={() => {}}
+        onPower={() => {}}
+        onQuantile={() => {}}
+        onZoom={() => {}}
+        onClose={() => setEditingPanel(null)}
+      />
+    );
+  } else if (editingPanel != null) {
+    const i = dpViews.findIndex((v) => v.key === editingPanel);
+    if (i >= 0) {
+      const view = dpViews[i];
+      panelEditor = (
+        <PanelEditor
+          title={view.title}
+          isPolar={false}
+          preview={
+            <ImagePanel
+              data={view.data}
+              width={view.width}
+              height={view.height}
+              cmap={view.cmap}
+              vmin={view.vmin == null ? view.dataVmin : view.vmin}
+              vmax={view.vmax == null ? view.dataVmax : view.vmax}
+              displayWidth={480}
+              title={`${view.title} (preview)`}
+              overlay={makeDpOverlay(view)}
+            />
+          }
+          cmap={dpViewCmaps?.[i] ?? view.cmap}
+          vmin={dpViewVmins?.[i] ?? null}
+          vmax={dpViewVmaxs?.[i] ?? null}
+          dataVmin={view.dataVmin}
+          dataVmax={view.dataVmax}
+          sigma={dpViewSigmas?.[i] ?? null}
+          power={dpViewPowers?.[i] ?? null}
+          upperQuantile={dpViewUpperQuantiles?.[i] ?? null}
+          zoom={dpViewZooms?.[i] ?? null}
+          onCmap={(v) => setPanelDisplay(setDpViewCmaps, dpViewCmaps, i, v)}
+          onVmin={(v) => setPanelDisplay(setDpViewVmins, dpViewVmins, i, v)}
+          onVmax={(v) => setPanelDisplay(setDpViewVmaxs, dpViewVmaxs, i, v)}
+          onSigma={(v) => commitPanelTransform("dp_view_sigmas", dpViewSigmas, i, v)}
+          onPower={(v) => commitPanelTransform("dp_view_powers", dpViewPowers, i, v)}
+          onQuantile={(v) => commitPanelTransform("dp_view_upper_quantiles", dpViewUpperQuantiles, i, v)}
+          onZoom={(v) => commitPanelTransform("dp_view_zooms", dpViewZooms, i, v)}
+          onClose={() => setEditingPanel(null)}
+        />
+      );
+    }
+  }
+
   return (
     <div
       ref={containerRef}
@@ -932,6 +1233,7 @@ function ShowPolymer4DSTEM() {
             displayWidth={view.key === "current" ? 300 : 220}
             title={`${view.title} DP (Ry=${posRy}, Rx=${posRx})`}
             overlay={makeDpOverlay(view)}
+            onAdjust={() => setEditingPanel(view.key)}
           />
         ))}
         {hasPolar && showPolar ? (
@@ -939,19 +1241,21 @@ function ShowPolymer4DSTEM() {
             data={polarData}
             width={polarWidth}
             height={polarHeight}
-            cmap={dpCmap}
-            vmin={polarVmin}
-            vmax={polarVmax}
+            cmap={effPolarCmap}
+            vmin={effPolarVmin}
+            vmax={effPolarVmax}
             displayWidth={320}
             title={`Polar (Ry=${posRy}, Rx=${posRx})`}
             overlay={polarOverlay}
             aspectAuto
+            onAdjust={() => setEditingPanel("polar")}
           />
         ) : null}
       </div>
       {hasPeaks && showPeaks && (!peaksX || peaksX.length === 0) ? (
         <div style={{ fontSize: 11, color: "#888", marginTop: 4 }}>No peaks at this scan position.</div>
       ) : null}
+      {panelEditor}
     </div>
   );
 }
