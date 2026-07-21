@@ -18,7 +18,9 @@ Public entry point::
     w = show_polymer_4DSTEM(bragg_peaks)   # bragg_peaks: BraggPeaksPolymer
 """
 
+import copy
 import pathlib
+import warnings
 
 import anywidget
 import numpy as np
@@ -159,14 +161,33 @@ def _has_peaks(px, py):
     return px is not None and py is not None and len(px) > 0 and len(py) > 0
 
 
-def _central_peak_index(px, py, r_invA, center):
-    """Index of the central beam: smallest r, else nearest to center."""
+def _central_beam_max_dist(dp_shape):
+    """Pixel radius within which a detected peak counts as the central beam.
+
+    Small enough that finite-q Bragg peaks are never mistaken for the beam, generous
+    enough to absorb a few-pixel disagreement between center-finding and peak detection.
+    """
+    return max(4.0, 0.03 * min(dp_shape[0], dp_shape[1]))
+
+
+def _central_peak_index(px, py, r_invA, center, max_dist=None):
+    """Index of the detected central-beam peak, or -1.
+
+    The peak nearest the calibrated ``center`` (from ``image_centers``), but only when
+    within ``max_dist`` px. The filled central marker is always drawn at ``center``
+    itself; this index only flags which peak, if any, to drop from the open-circle set so
+    a ring is not drawn on the beam. ``r_invA`` is unused (kept for call-site
+    compatibility): picking the smallest polar radius made the marker jump to an
+    off-center low-q Bragg peak when the beam was not itself detected.
+    """
     if not _has_peaks(px, py):
         return -1
-    if r_invA is not None and len(r_invA) > 0:
-        return int(np.argmin(r_invA))
     cy, cx = center
-    return int(np.argmin((np.asarray(px) - cx) ** 2 + (np.asarray(py) - cy) ** 2))
+    d2 = (np.asarray(px) - cx) ** 2 + (np.asarray(py) - cy) ** 2
+    idx = int(np.argmin(d2))
+    if max_dist is not None and d2[idx] > max_dist ** 2:
+        return -1
+    return idx
 
 
 def _as_float_list(arr):
@@ -286,6 +307,68 @@ def _central_px_to_scaling(radius_px):
     return float(max(0.0, float(radius_px)) / 5.0)
 
 
+# Display-only traits that make up a saved "subpanel visualization" preset. The
+# Save-settings button snapshots these onto the source BraggPeaksPolymer, and the next
+# widget built from that same object restores them (see _collect/_apply_view_settings),
+# so re-opening with a different intensity_map keeps the hand-tuned look. Excludes data
+# bytes, geometry, scan position, and the disk-save (save_*) traits.
+_VIEW_SETTING_PANEL_LIST_TRAITS = (
+    "dp_view_cmaps",
+    "dp_view_colors",
+    "dp_view_central_colors",
+    "dp_view_marker_scaled",
+    "dp_view_marker_sizes",
+    "dp_view_marker_size_mins",
+    "dp_view_marker_size_maxs",
+    "dp_view_show_central",
+    "dp_view_central_sizes",
+    "dp_view_vmins",
+    "dp_view_vmaxs",
+    "dp_view_sigmas",
+    "dp_view_powers",
+    "dp_view_upper_quantiles",
+    "dp_view_zooms",
+)
+_VIEW_SETTING_GLOBAL_TRAITS = (
+    "map_cmap",
+    "dp_cmap",
+    "dp_vmin",
+    "dp_vmax",
+    "show_inset",
+    "inset_size",
+    "show_peaks",
+    "show_polar",
+    "peak_color",
+    "central_color",
+    "polar_cmap",
+    "polar_display_vmin",
+    "polar_display_vmax",
+)
+_VIEW_SETTING_TRAITS = _VIEW_SETTING_PANEL_LIST_TRAITS + _VIEW_SETTING_GLOBAL_TRAITS
+
+
+def _collect_view_settings(widget):
+    """Snapshot the widget's current subpanel display settings into a plain dict."""
+    return {name: copy.deepcopy(getattr(widget, name)) for name in _VIEW_SETTING_TRAITS}
+
+
+def _apply_view_settings(widget, settings):
+    """Overlay a saved settings dict onto a widget's display traits, in place.
+
+    Per-panel list traits are applied only when their length matches the widget's current
+    panel count, so a stale preset (from a different panel set) can't corrupt the arrays.
+    """
+    n_panels = len(_DP_VIEW_PRESETS)
+    panel_list = set(_VIEW_SETTING_PANEL_LIST_TRAITS)
+    for name in _VIEW_SETTING_TRAITS:
+        if name not in settings:
+            continue
+        value = settings[name]
+        if name in panel_list and (value is None or len(value) != n_panels):
+            continue
+        setattr(widget, name, copy.deepcopy(value))
+
+
 class ShowPolymer4DSTEM(anywidget.AnyWidget):
     """Live-kernel Bragg-peak / polymer 4D-STEM viewer.
 
@@ -341,6 +424,10 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
     save_panels = traitlets.List(traitlets.Unicode()).tag(sync=True)  # which DP panels to save
     save_request = traitlets.Int(0).tag(sync=True)                # frontend increments to trigger
     save_status = traitlets.Unicode("").tag(sync=True)            # Python writes result/errors
+
+    # --- Save/restore subpanel display settings (in-memory, on the source bp object) ---
+    save_view_request = traitlets.Int(0).tag(sync=True)           # frontend increments to trigger
+    view_settings_status = traitlets.Unicode("").tag(sync=True)   # Python writes confirmation/errors
 
     peak_color = traitlets.Unicode("#ff3b30").tag(sync=True)
     central_color = traitlets.Unicode("#ff3b30").tag(sync=True)
@@ -484,6 +571,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
         infer_device=None,
         scan_mask=None,
         save_dir=None,
+        restore_view_settings=True,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -539,13 +627,12 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             mask = scan_mask if scan_mask is not None else getattr(bragg_peaks, "scan_mask", None)
             if scan_mask is not None and hasattr(type(bragg_peaks), "scan_mask"):
                 bragg_peaks.scan_mask = scan_mask  # keep object + widget in agreement
-            # Peaks are produced on the fly; warm the input-normalization cache AND adapt
-            # BatchNorm to this dataset (over the ROI) once, so the first cursor move isn't
-            # slow and live (eval-mode) inference is domain-adapted from the start. Polar is
-            # a separate precompute, disabled here.
+            # Peaks are produced on the fly. Warm the input-normalization cache (median/iqr
+            # over the ROI) so the first cursor move isn't slow. Live inference defaults to
+            # bn_mode="train_batch" (runs each DP inside its find_peaks_model train-mode chunk,
+            # matching the precomputed detection), so no eval-mode adapt_batchnorm is needed
+            # here. Polar is a separate precompute, disabled here.
             bragg_peaks.ensure_normalization_params(device=infer_device, scan_mask=mask)
-            if hasattr(bragg_peaks, "adapt_batchnorm"):
-                bragg_peaks.adapt_batchnorm(device=infer_device, scan_mask=mask)
             has_peaks = True
             has_polar = False
         else:
@@ -627,6 +714,14 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 self.polar_annular_bins = int(getattr(bragg_peaks, "num_annular_bins", 0) or 0)
                 self.max_radius_invA = float(getattr(bragg_peaks, "max_radius_invA", 0.0) or 0.0)
 
+            # Restore previously-saved subpanel display settings (in-memory, from the
+            # source bp). Applied after presets/kwargs so a saved look wins, and before
+            # _update_payload so restored transform params (sigma/power/quantile/zoom)
+            # feed the first recompute.
+            saved = getattr(bragg_peaks, "_widget_view_settings", None)
+            if restore_view_settings and saved:
+                _apply_view_settings(self, saved)
+
             # Initial selected position (center of scan, in DATA coords).
             self.pos_ry = Ry // 2 if ry is None else int(ry)
             self.pos_rx = Rx // 2 if rx is None else int(rx)
@@ -640,6 +735,7 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             names=["dp_view_sigmas", "dp_view_powers", "dp_view_upper_quantiles", "dp_view_zooms"],
         )
         self.observe(self._on_save_request, names=["save_request"])
+        self.observe(self._on_save_view_request, names=["save_view_request"])
 
     # -- live-kernel recompute ------------------------------------------------
     def _on_pos_change(self, _change):
@@ -656,6 +752,14 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self._save_current_position()
         except Exception as exc:  # surface the failure in the widget UI
             self.save_status = f"Save failed: {exc}"
+
+    # -- save subpanel display settings (in-memory, on the source bp) ---------
+    def _on_save_view_request(self, _change):
+        try:
+            self._bp._widget_view_settings = _collect_view_settings(self)
+            self.view_settings_status = "Saved display settings ✓"
+        except Exception as exc:  # surface the failure in the widget UI
+            self.view_settings_status = f"Save failed: {exc}"
 
     def _save_current_position(self):
         bp = self._bp
@@ -677,10 +781,28 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
 
         def _panel_kwargs(i):
             power = self.dp_view_powers[i]
+            # Mirror the frontend's effective-contrast fallback so the PDF matches what is
+            # displayed. The live view resolves each limit as:
+            #   per-panel override (dp_view_vmins[i]) -> global (dp_vmin) -> auto
+            # where "auto" is the 1st/99th percentile of the processed DP
+            # (dp_{key}_data_vmin/vmax, from _display_limits). A bare None here would leave
+            # matplotlib to autoscale to full min/max, which the hot central beam compresses
+            # into a dark image -- the source of the "save darker than widget" mismatch.
+            key = _DP_VIEW_PRESETS[i]["key"]
+
+            def _eff(per_panel, global_val, auto_attr):
+                if per_panel is not None:
+                    return per_panel
+                if global_val is not None:
+                    return global_val
+                return getattr(self, auto_attr, None)
+
+            vmin = _eff(self.dp_view_vmins[i], self.dp_vmin, f"dp_{key}_data_vmin")
+            vmax = _eff(self.dp_view_vmaxs[i], self.dp_vmax, f"dp_{key}_data_vmax")
             kw = dict(
                 dp_cmap=self.dp_view_cmaps[i],
-                vmin_cartesian=self.dp_view_vmins[i],
-                vmax_cartesian=self.dp_view_vmaxs[i],
+                vmin_cartesian=vmin,
+                vmax_cartesian=vmax,
                 norm_upper_quantile=self.dp_view_upper_quantiles[i],
                 norm_power=1.0 if power is None else float(power),
                 gaussian_filter_sigma=self.dp_view_sigmas[i],
@@ -688,7 +810,10 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 selected_peak_color=self.dp_view_colors[i],
                 central_beam_color=self.dp_view_central_colors[i],
                 crosshair_width_peaks=2,
-                peak_alpha=0.9,
+                # Match the live overlay: rings/central dot are fully opaque, and the
+                # central-beam dot is stroked at 1.5 px (see drawDot in the frontend).
+                peak_alpha=1.0,
+                central_linewidth=1.5,
                 show_central_beam=bool(self.dp_view_show_central[i]),
                 crosshair_scaling_central_beam=_central_px_to_scaling(self.dp_view_central_sizes[i]),
             )
@@ -813,7 +938,9 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
             self.peaks_x = _as_float_list(px)
             self.peaks_y = _as_float_list(py)
             self.peaks_intensity = _as_float_list(ints)
-            self.central_idx = _central_peak_index(px, py, r_invA, center)
+            self.central_idx = _central_peak_index(
+                px, py, r_invA, center, max_dist=_central_beam_max_dist(base_dp.shape)
+            )
         else:
             self.peaks_x, self.peaks_y, self.peaks_intensity = [], [], []
             self.central_idx = -1
@@ -891,7 +1018,10 @@ class ShowPolymer4DSTEM(anywidget.AnyWidget):
                 peak_y = [shifted_y[i] for i in keep]
                 peak_i_source = _as_float_list(ints)
                 peak_i = [peak_i_source[i] if i < len(peak_i_source) else 1.0 for i in keep]
-                central_source = _central_peak_index(px, py, r_invA, source_center)
+                central_source = _central_peak_index(
+                    px, py, r_invA, source_center,
+                    max_dist=_central_beam_max_dist((self.dp_height, self.dp_width)),
+                )
                 try:
                     central_idx = keep.index(central_source)
                 except ValueError:
@@ -980,6 +1110,13 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
         omitted, reuses the mask ``find_peaks_model`` stored on the object; if none exists,
         the whole scan is used. Pass e.g. ``scan_mask=mask['mask']`` from
         ``create_interactive_circular_mask`` when using live mode without ``find_peaks_model``.
+    restore_view_settings : bool, default True
+        Restore subpanel display settings previously captured by the widget's
+        "Save settings" button (stored in-memory on this ``bragg_peaks`` object). When
+        settings have been saved they take precedence over the display kwargs above, so
+        recalling the widget with a different ``intensity_map`` keeps the tuned look. Pass
+        ``False`` for a fresh widget at preset defaults, or clear with
+        ``bragg_peaks._widget_view_settings = None``.
 
     Returns
     -------
@@ -992,4 +1129,12 @@ def show_polymer_4DSTEM(bragg_peaks, **kwargs):
     >>> w = show_polymer_4DSTEM(bragg_peaks)            # doctest: +SKIP
     >>> w = show_polymer_4DSTEM(bragg_peaks, vmax_cartesian=None)  # doctest: +SKIP
     """
+    if getattr(bragg_peaks, "image_centers", None) is None:
+        warnings.warn(
+            "bragg_peaks.image_centers is None: the central-beam marker will fall back to "
+            "the geometric image center, not the calibrated beam center. Run "
+            "bragg_peaks.process_polar(...) (or find_central_beams_4d / load_image_centers) "
+            "before show_widget to use the pipeline (Karen's angular-uniformity) center.",
+            stacklevel=2,
+        )
     return ShowPolymer4DSTEM(bragg_peaks, **kwargs)

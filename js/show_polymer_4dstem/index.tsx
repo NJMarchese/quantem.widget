@@ -113,6 +113,12 @@ interface DpView {
   centerX: number;
   peakColor: string;
   centralColor: string;
+  markerScaled: boolean;
+  markerSize: number;
+  markerSizeMin: number;
+  markerSizeMax: number;
+  showCentral: boolean;
+  centralSize: number;
 }
 
 function ImagePanel(props: ImagePanelProps) {
@@ -276,6 +282,7 @@ function ImagePanel(props: ImagePanelProps) {
             style={{
               fontSize: 11, lineHeight: 1, padding: "2px 6px", cursor: "pointer",
               border: "1px solid #bbb", borderRadius: 4, background: "#f5f5f5",
+              color: "#222",
             }}
           >
             ⚙ Adjust
@@ -440,7 +447,7 @@ function EditorRow(props: {
           const v = parseFloat(s);
           if (Number.isFinite(v)) onChange(v);
         }}
-        style={{ width: 64 }}
+        style={{ width: 64, background: "#fff", color: "#222", border: "1px solid #bbb" }}
       />
       {nullable ? (
         <button
@@ -452,6 +459,22 @@ function EditorRow(props: {
           auto
         </button>
       ) : null}
+    </div>
+  );
+}
+
+// One labeled color row: native color picker + a free-text field (so named CSS colors
+// like "cyan" also work, which the canvas accepts even though the picker needs hex).
+function ColorRow(props: { label: string; value: string; onChange: (v: string) => void }) {
+  const { label, value, onChange } = props;
+  const hex = /^#[0-9a-fA-F]{6}$/.test(value) ? value : "#ff0000";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "6px 0", fontSize: 12 }}>
+      <span style={{ width: 110 }}>{label}</span>
+      <input type="color" value={hex} onChange={(e) => onChange(e.target.value)}
+        style={{ width: 40, height: 22, padding: 0, cursor: "pointer" }} />
+      <input type="text" value={value} onChange={(e) => onChange(e.target.value)}
+        style={{ width: 80, background: "#fff", color: "#222", border: "1px solid #bbb" }} />
     </div>
   );
 }
@@ -469,6 +492,15 @@ interface PanelEditorProps {
   power: number | null;
   upperQuantile: number | null;
   zoom: number | null;
+  // Peak / central-beam marker controls (only rendered for DP panels, so optional).
+  peakColor?: string;
+  centralColor?: string;
+  markerScaled?: boolean;
+  markerSize?: number;
+  markerSizeMin?: number;
+  markerSizeMax?: number;
+  showCentral?: boolean;
+  centralSize?: number;
   onCmap: (v: string) => void;
   onVmin: (v: number | null) => void;
   onVmax: (v: number | null) => void;
@@ -476,6 +508,14 @@ interface PanelEditorProps {
   onPower: (v: number | null) => void;
   onQuantile: (v: number | null) => void;
   onZoom: (v: number | null) => void;
+  onPeakColor?: (v: string) => void;
+  onCentralColor?: (v: string) => void;
+  onMarkerScaled?: (v: boolean) => void;
+  onMarkerSize?: (v: number) => void;
+  onMarkerSizeMin?: (v: number) => void;
+  onMarkerSizeMax?: (v: number) => void;
+  onShowCentral?: (v: boolean) => void;
+  onCentralSize?: (v: number) => void;
   onSave?: () => void;
   onClose: () => void;
 }
@@ -487,7 +527,13 @@ function PanelEditor(props: PanelEditorProps) {
   const {
     title, isPolar, preview, cmap, vmin, vmax, dataVmin, dataVmax,
     sigma, power, upperQuantile, zoom,
-    onCmap, onVmin, onVmax, onSigma, onPower, onQuantile, onZoom, onSave, onClose,
+    peakColor = "#ff0000", centralColor = "#00d5e8",
+    markerScaled = true, markerSize = 8, markerSizeMin = 4, markerSizeMax = 16,
+    showCentral = true, centralSize = 5,
+    onCmap, onVmin, onVmax, onSigma, onPower, onQuantile, onZoom,
+    onPeakColor = () => {}, onCentralColor = () => {}, onMarkerScaled = () => {},
+    onMarkerSize = () => {}, onMarkerSizeMin = () => {}, onMarkerSizeMax = () => {},
+    onShowCentral = () => {}, onCentralSize = () => {}, onSave, onClose,
   } = props;
   const vspan = Math.max(1e-6, dataVmax - dataVmin || 1);
   const vlo = dataVmin - vspan;
@@ -503,7 +549,7 @@ function PanelEditor(props: PanelEditorProps) {
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: "#fff", borderRadius: 8, padding: 16, maxWidth: "92vw", maxHeight: "92vh",
+          background: "#fff", color: "#222", borderRadius: 8, padding: 16, maxWidth: "92vw", maxHeight: "92vh",
           overflow: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.3)", display: "flex", gap: 16,
           fontFamily: "sans-serif", alignItems: "flex-start",
         }}
@@ -537,7 +583,36 @@ function PanelEditor(props: PanelEditorProps) {
               <EditorRow label="upper quantile" value={upperQuantile} min={0.9} max={1} step={0.0001} onChange={onQuantile} nullable />
               <EditorRow label="zoom" value={zoom} min={1} max={8} step={0.25} onChange={onZoom} />
               <div style={{ fontSize: 10, color: "#888", marginTop: 6 }}>
-                sigma / power / quantile / zoom recompute the panel in the kernel; colormap / vmin / vmax are instant.
+                sigma / power / quantile / zoom recompute the panel in the kernel; the rest are instant.
+              </div>
+              <div style={{ borderTop: "1px solid #eee", marginTop: 8, paddingTop: 6 }}>
+                <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 2 }}>Peaks</div>
+                <ColorRow label="peak color" value={peakColor} onChange={onPeakColor} />
+                <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6, margin: "6px 0" }}>
+                  <input type="checkbox" checked={markerScaled} onChange={(e) => onMarkerScaled(e.target.checked)} />
+                  Scale size by intensity
+                </label>
+                {markerScaled ? (
+                  <>
+                    <EditorRow label="size min" value={markerSizeMin} min={1} max={40} step={0.5} onChange={(v) => onMarkerSizeMin(v ?? 1)} />
+                    <EditorRow label="size max" value={markerSizeMax} min={1} max={80} step={0.5} onChange={(v) => onMarkerSizeMax(v ?? 1)} />
+                  </>
+                ) : (
+                  <EditorRow label="marker size" value={markerSize} min={1} max={60} step={0.5} onChange={(v) => onMarkerSize(v ?? 1)} />
+                )}
+              </div>
+              <div style={{ borderTop: "1px solid #eee", marginTop: 8, paddingTop: 6 }}>
+                <div style={{ fontWeight: 600, fontSize: 12, marginBottom: 2 }}>Central beam</div>
+                <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6, margin: "6px 0" }}>
+                  <input type="checkbox" checked={showCentral} onChange={(e) => onShowCentral(e.target.checked)} />
+                  Show central marker
+                </label>
+                {showCentral ? (
+                  <>
+                    <ColorRow label="central color" value={centralColor} onChange={onCentralColor} />
+                    <EditorRow label="central size" value={centralSize} min={1} max={40} step={0.5} onChange={(v) => onCentralSize(v ?? 1)} />
+                  </>
+                ) : null}
               </div>
             </>
           ) : (
@@ -585,8 +660,8 @@ function ShowPolymer4DSTEM() {
 
   const [peakColor] = useModelState<string>("peak_color");
   const [centralColor] = useModelState<string>("central_color");
-  const [peakSizeMin] = useModelState<number>("peak_size_min");
-  const [peakSizeMax] = useModelState<number>("peak_size_max");
+  // Peak marker size is now per-panel (dp_view_marker_* lists); the global
+  // peak_size_min/max traits are no longer read by the overlay.
 
   const [posRy] = useModelState<number>("pos_ry");
   const [posRx] = useModelState<number>("pos_rx");
@@ -617,10 +692,17 @@ function ShowPolymer4DSTEM() {
   // Display-only params (cmap/vmin/vmax): setters re-render locally + persist to
   // Python (which ignores them — no recompute).
   const [dpViewCmaps, setDpViewCmaps] = useModelState<string[]>("dp_view_cmaps");
-  const [dpViewColors] = useModelState<string[]>("dp_view_colors");
-  const [dpViewCentralColors] = useModelState<string[]>("dp_view_central_colors");
+  const [dpViewColors, setDpViewColors] = useModelState<string[]>("dp_view_colors");
+  const [dpViewCentralColors, setDpViewCentralColors] = useModelState<string[]>("dp_view_central_colors");
   const [dpViewVmins, setDpViewVmins] = useModelState<Array<number | null>>("dp_view_vmins");
   const [dpViewVmaxs, setDpViewVmaxs] = useModelState<Array<number | null>>("dp_view_vmaxs");
+  // Per-panel peak-marker + central-beam controls (display-only, like cmap/vmin/vmax).
+  const [dpViewMarkerScaled, setDpViewMarkerScaled] = useModelState<boolean[]>("dp_view_marker_scaled");
+  const [dpViewMarkerSizes, setDpViewMarkerSizes] = useModelState<number[]>("dp_view_marker_sizes");
+  const [dpViewMarkerSizeMins, setDpViewMarkerSizeMins] = useModelState<number[]>("dp_view_marker_size_mins");
+  const [dpViewMarkerSizeMaxs, setDpViewMarkerSizeMaxs] = useModelState<number[]>("dp_view_marker_size_maxs");
+  const [dpViewShowCentral, setDpViewShowCentral] = useModelState<boolean[]>("dp_view_show_central");
+  const [dpViewCentralSizes, setDpViewCentralSizes] = useModelState<number[]>("dp_view_central_sizes");
   // Data-transform params (sigma/power/upper-quantile/zoom): editing these must trigger
   // a Python recompute (routed through the throttle), so write via model.set, not here.
   const [dpViewSigmas] = useModelState<Array<number | null>>("dp_view_sigmas");
@@ -639,6 +721,7 @@ function ShowPolymer4DSTEM() {
   const [saveIncludePolar, setSaveIncludePolar] = useModelState<boolean>("save_include_polar");
   const [savePanels] = useModelState<string[]>("save_panels");
   const [saveStatus] = useModelState<string>("save_status");
+  const [viewSettingsStatus] = useModelState<string>("view_settings_status");
 
   const [dpCurrentBytes] = useModelState<unknown>("dp_current_bytes");
   const [dpCurrentHeight] = useModelState<number>("dp_current_height");
@@ -811,6 +894,14 @@ function ShowPolymer4DSTEM() {
     [model],
   );
 
+  // Snapshot the current subpanel display settings on the kernel so the next widget
+  // (same bragg_peaks) restores them: bump save_view_request.
+  const fireSaveSettings = useCallback(() => {
+    model.set("view_settings_status", "Saving…");
+    model.set("save_view_request", ((model.get("save_view_request") as number) ?? 0) + 1);
+    model.save_changes();
+  }, [model]);
+
   // Root container is focusable so it can receive arrow-key events; clicking the
   // map focuses it so keyboard nav works without an extra tab/click.
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -932,6 +1023,12 @@ function ShowPolymer4DSTEM() {
         centerX: dpCurrentCenterX || centerX,
         peakColor: dpViewColors?.[0] ?? peakColor,
         centralColor: dpViewCentralColors?.[0] ?? centralColor,
+        markerScaled: dpViewMarkerScaled?.[0] ?? true,
+        markerSize: dpViewMarkerSizes?.[0] ?? 8,
+        markerSizeMin: dpViewMarkerSizeMins?.[0] ?? 4,
+        markerSizeMax: dpViewMarkerSizeMaxs?.[0] ?? 16,
+        showCentral: dpViewShowCentral?.[0] ?? true,
+        centralSize: dpViewCentralSizes?.[0] ?? 5,
       },
       {
         key: "lamellar",
@@ -952,6 +1049,12 @@ function ShowPolymer4DSTEM() {
         centerX: dpLamellarCenterX,
         peakColor: dpViewColors?.[1] ?? "#ff1f1f",
         centralColor: dpViewCentralColors?.[1] ?? "#00d5e8",
+        markerScaled: dpViewMarkerScaled?.[1] ?? true,
+        markerSize: dpViewMarkerSizes?.[1] ?? 8,
+        markerSizeMin: dpViewMarkerSizeMins?.[1] ?? 4,
+        markerSizeMax: dpViewMarkerSizeMaxs?.[1] ?? 16,
+        showCentral: dpViewShowCentral?.[1] ?? true,
+        centralSize: dpViewCentralSizes?.[1] ?? 5,
       },
       {
         key: "backbone",
@@ -972,6 +1075,12 @@ function ShowPolymer4DSTEM() {
         centerX: dpBackboneCenterX,
         peakColor: dpViewColors?.[2] ?? "#7bdc3c",
         centralColor: dpViewCentralColors?.[2] ?? "#00d5e8",
+        markerScaled: dpViewMarkerScaled?.[2] ?? true,
+        markerSize: dpViewMarkerSizes?.[2] ?? 8,
+        markerSizeMin: dpViewMarkerSizeMins?.[2] ?? 4,
+        markerSizeMax: dpViewMarkerSizeMaxs?.[2] ?? 16,
+        showCentral: dpViewShowCentral?.[2] ?? true,
+        centralSize: dpViewCentralSizes?.[2] ?? 5,
       },
       {
         key: "pipi",
@@ -992,10 +1101,18 @@ function ShowPolymer4DSTEM() {
         centerX: dpPipiCenterX,
         peakColor: dpViewColors?.[3] ?? "#ffee00",
         centralColor: dpViewCentralColors?.[3] ?? "#00d5e8",
+        markerScaled: dpViewMarkerScaled?.[3] ?? true,
+        markerSize: dpViewMarkerSizes?.[3] ?? 8,
+        markerSizeMin: dpViewMarkerSizeMins?.[3] ?? 4,
+        markerSizeMax: dpViewMarkerSizeMaxs?.[3] ?? 16,
+        showCentral: dpViewShowCentral?.[3] ?? true,
+        centralSize: dpViewCentralSizes?.[3] ?? 5,
       },
     ],
     [
       dpViewTitles, dpViewCmaps, dpViewVmins, dpViewVmaxs, dpViewColors, dpViewCentralColors,
+      dpViewMarkerScaled, dpViewMarkerSizes, dpViewMarkerSizeMins, dpViewMarkerSizeMaxs,
+      dpViewShowCentral, dpViewCentralSizes,
       dpCurrentData, dpCurrentWidth, dpCurrentHeight, dpCurrentDataVmin, dpCurrentDataVmax,
       dpCurrentPeaksX, dpCurrentPeaksY, dpCurrentPeaksIntensity, dpCurrentCentralIdx,
       dpCurrentCenterY, dpCurrentCenterX, dpData, dpWidth, dpHeight, dpCmap, dpUseVmin,
@@ -1023,8 +1140,16 @@ function ShowPolymer4DSTEM() {
         ctx.strokeStyle = "#000";
         ctx.stroke();
       };
+      // The central-beam marker is ALWAYS drawn at the calibrated center
+      // (image_centers / find_central_beams_4d, sent as centerX/centerY), never on a
+      // detected peak — so it can't jump to an off-center low-q Bragg peak. centralIdx
+      // now only flags the beam peak (nearest the center, within a few px) so we skip a
+      // duplicate hollow ring there; it is -1 when no detected peak is near the center.
+      const drawCentral = () => {
+        if (view.showCentral) drawDot(view.centerX, view.centerY, view.centralSize, view.centralColor);
+      };
       if (!showPeaks || !view.peaksX || view.peaksX.length === 0) {
-        drawDot(view.centerX, view.centerY, 5, view.centralColor);
+        drawCentral();
         return;
       }
       let imin = Infinity;
@@ -1039,20 +1164,22 @@ function ShowPolymer4DSTEM() {
         const x = view.peaksX[i];
         const y = view.peaksY[i];
         if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-        if (i === view.centralIdx) {
-          drawDot(x, y, 5, view.centralColor);
-          continue;
+        if (i === view.centralIdx) continue;  // beam peak: no hollow ring (marker drawn at center below)
+        // Uniform size, or interpolate between min/max by normalized intensity.
+        let r = view.markerSize;
+        if (view.markerScaled) {
+          const norm = view.peaksIntensity.length ? (view.peaksIntensity[i] - imin) / range : 0.5;
+          r = view.markerSizeMin + (Number.isFinite(norm) ? norm : 0.5) * (view.markerSizeMax - view.markerSizeMin);
         }
-        const norm = view.peaksIntensity.length ? (view.peaksIntensity[i] - imin) / range : 0.5;
-        const r = peakSizeMin + (Number.isFinite(norm) ? norm : 0.5) * (peakSizeMax - peakSizeMin);
         ctx.beginPath();
         ctx.arc((x + 0.5) * scaleX, (y + 0.5) * scaleY, r, 0, 2 * Math.PI);
         ctx.lineWidth = 2;
         ctx.strokeStyle = view.peakColor;
         ctx.stroke();
       }
+      drawCentral();  // on top of the rings, at the calibrated beam center
     },
-    [showPeaks, peakSizeMin, peakSizeMax],
+    [showPeaks],
   );
 
   const checkbox = (label: string, checked: boolean, onChange: (v: boolean) => void) => (
@@ -1165,6 +1292,14 @@ function ShowPolymer4DSTEM() {
           power={dpViewPowers?.[i] ?? null}
           upperQuantile={dpViewUpperQuantiles?.[i] ?? null}
           zoom={dpViewZooms?.[i] ?? null}
+          peakColor={view.peakColor}
+          centralColor={view.centralColor}
+          markerScaled={view.markerScaled}
+          markerSize={view.markerSize}
+          markerSizeMin={view.markerSizeMin}
+          markerSizeMax={view.markerSizeMax}
+          showCentral={view.showCentral}
+          centralSize={view.centralSize}
           onCmap={(v) => setPanelDisplay(setDpViewCmaps, dpViewCmaps, i, v)}
           onVmin={(v) => setPanelDisplay(setDpViewVmins, dpViewVmins, i, v)}
           onVmax={(v) => setPanelDisplay(setDpViewVmaxs, dpViewVmaxs, i, v)}
@@ -1172,6 +1307,14 @@ function ShowPolymer4DSTEM() {
           onPower={(v) => commitPanelTransform("dp_view_powers", dpViewPowers, i, v)}
           onQuantile={(v) => commitPanelTransform("dp_view_upper_quantiles", dpViewUpperQuantiles, i, v)}
           onZoom={(v) => commitPanelTransform("dp_view_zooms", dpViewZooms, i, v)}
+          onPeakColor={(v) => setPanelDisplay(setDpViewColors, dpViewColors, i, v)}
+          onCentralColor={(v) => setPanelDisplay(setDpViewCentralColors, dpViewCentralColors, i, v)}
+          onMarkerScaled={(v) => setPanelDisplay(setDpViewMarkerScaled, dpViewMarkerScaled, i, v)}
+          onMarkerSize={(v) => setPanelDisplay(setDpViewMarkerSizes, dpViewMarkerSizes, i, v)}
+          onMarkerSizeMin={(v) => setPanelDisplay(setDpViewMarkerSizeMins, dpViewMarkerSizeMins, i, v)}
+          onMarkerSizeMax={(v) => setPanelDisplay(setDpViewMarkerSizeMaxs, dpViewMarkerSizeMaxs, i, v)}
+          onShowCentral={(v) => setPanelDisplay(setDpViewShowCentral, dpViewShowCentral, i, v)}
+          onCentralSize={(v) => setPanelDisplay(setDpViewCentralSizes, dpViewCentralSizes, i, v)}
           onSave={() => fireSave([view.key], false, false)}
           onClose={() => setEditingPanel(null)}
         />
@@ -1195,7 +1338,7 @@ function ShowPolymer4DSTEM() {
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: "#fff", borderRadius: 8, padding: 16, minWidth: 380, maxWidth: "92vw",
+          background: "#fff", color: "#222", borderRadius: 8, padding: 16, minWidth: 380, maxWidth: "92vw",
           maxHeight: "92vh", overflow: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.3)",
           fontFamily: "sans-serif", fontSize: 12,
         }}
@@ -1214,7 +1357,7 @@ function ShowPolymer4DSTEM() {
             value={saveSubfolder ?? ""}
             placeholder="e.g. dataset1/run5"
             onChange={(e) => setSaveSubfolder(e.target.value)}
-            style={{ flex: 1, fontSize: 12 }}
+            style={{ flex: 1, fontSize: 12, background: "#fff", color: "#222", border: "1px solid #bbb" }}
           />
         </label>
         <div style={{ color: "#777", marginBottom: 10 }}>
@@ -1285,10 +1428,26 @@ function ShowPolymer4DSTEM() {
           style={{
             fontSize: 12, padding: "2px 10px", cursor: "pointer",
             border: "1px solid #bbb", borderRadius: 4, background: "#f5f5f5",
+            color: "#222",
           }}
         >
           Save…
         </button>
+        <button
+          type="button"
+          onClick={fireSaveSettings}
+          title="Save current subpanel display settings for reuse when this widget is reopened with a different intensity map"
+          style={{
+            fontSize: 12, padding: "2px 10px", cursor: "pointer",
+            border: "1px solid #bbb", borderRadius: 4, background: "#f5f5f5",
+            color: "#222",
+          }}
+        >
+          Save settings
+        </button>
+        {viewSettingsStatus ? (
+          <span style={{ fontSize: 11, color: "#555" }}>{viewSettingsStatus}</span>
+        ) : null}
         {liveInference ? (
           <label style={{ fontSize: 12, fontFamily: "sans-serif", display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ color: "#0a7", fontWeight: 600 }}>● live</span>
